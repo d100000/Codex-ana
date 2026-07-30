@@ -3,7 +3,19 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "本地 Codex 上游订阅分布分析看板",
+  "description": "安全采样 Codex 兼容中转接口，并可视化动态订阅等级分布",
+  "keywords": [
+    "codex",
+    "openai",
+    "subscription-tier",
+    "relay-analysis",
+    "security-dashboard"
+  ],
+  "homepage": "https://github.com/d100000/Codex-ana#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/d100000/Codex-ana.git"
+  },
   "scripts": {
     "start": "node server.mjs",
     "dev": "node --watch server.mjs",
