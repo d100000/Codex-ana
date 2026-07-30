@@ -177,6 +177,8 @@ const server = createServer(async (request, response) => {
           httpsUpstreamsOnly: !upstreamFetch.policy.allowHttp,
           privateUpstreamsAllowed:
             upstreamFetch.policy.allowPrivateNetworks,
+          proxyFakeIpFallback:
+            upstreamFetch.policy.proxyFakeIpFallback,
           maxActiveJobs: MAX_ACTIVE_JOBS,
           adminHistory: {
             enabled: adminAuth.enabled,

@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import {
   createSafeFetch,
   isPublicAddress,
+  isProxyFakeIpAddress,
   resolveSafeTarget,
   UpstreamSecurityError,
 } from "../src/safe-fetch.mjs";
@@ -17,6 +18,7 @@ test("public address classifier blocks internal and special networks", () => {
     "169.254.169.254",
     "172.16.0.1",
     "192.168.1.1",
+    "198.18.0.1",
     "198.51.100.3",
     "::1",
     "fc00::1",
@@ -28,6 +30,9 @@ test("public address classifier blocks internal and special networks", () => {
   }
   assert.equal(isPublicAddress("8.8.8.8"), true);
   assert.equal(isPublicAddress("2606:4700:4700::1111"), true);
+  assert.equal(isProxyFakeIpAddress("198.18.0.1"), true);
+  assert.equal(isProxyFakeIpAddress("198.19.255.254"), true);
+  assert.equal(isProxyFakeIpAddress("198.20.0.1"), false);
 });
 
 test("upstream policy defaults to HTTPS and public DNS results", async () => {
@@ -60,6 +65,68 @@ test("upstream policy defaults to HTTPS and public DNS results", async () => {
     },
   );
   assert.equal(target.selectedAddress.address, "93.184.216.34");
+});
+
+test("proxy Fake-IP answers require a public DNS verification", async () => {
+  const cache = new Map();
+  let publicResolutionCount = 0;
+  const options = {
+    cache,
+    resolver: async () => [
+      { address: "198.18.0.110", family: 4 },
+    ],
+    publicResolver: async (hostname) => {
+      publicResolutionCount += 1;
+      assert.equal(hostname, "gateway.example");
+      return [
+        { address: "104.21.8.114", family: 4 },
+        { address: "172.67.188.114", family: 4 },
+      ];
+    },
+  };
+
+  const target = await resolveSafeTarget(
+    "https://gateway.example/v1",
+    options,
+  );
+  assert.equal(target.selectedAddress.address, "104.21.8.114");
+  assert.deepEqual(target.addresses, [
+    { address: "104.21.8.114", family: 4 },
+    { address: "172.67.188.114", family: 4 },
+  ]);
+
+  const cachedTarget = await resolveSafeTarget(
+    "https://gateway.example/v1/models",
+    options,
+  );
+  assert.equal(cachedTarget.selectedAddress.address, "104.21.8.114");
+  assert.equal(publicResolutionCount, 1);
+});
+
+test("unverified Fake-IP answers and literal Fake-IP URLs stay blocked", async () => {
+  await assert.rejects(
+    resolveSafeTarget("https://gateway.example/v1", {
+      resolver: async () => [
+        { address: "198.18.0.110", family: 4 },
+      ],
+      publicResolver: async () => [
+        { address: "127.0.0.1", family: 4 },
+      ],
+    }),
+    (error) => error.code === "proxy_fake_ip_unverified",
+  );
+
+  let publicResolverCalled = false;
+  await assert.rejects(
+    resolveSafeTarget("https://198.18.0.110/v1", {
+      publicResolver: async () => {
+        publicResolverCalled = true;
+        return [{ address: "93.184.216.34", family: 4 }];
+      },
+    }),
+    (error) => error.code === "private_upstream_blocked",
+  );
+  assert.equal(publicResolverCalled, false);
 });
 
 test("upstream allowlists reject unexpected hosts and ports", async () => {

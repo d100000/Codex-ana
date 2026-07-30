@@ -8,8 +8,12 @@ const DEFAULT_MAX_RESPONSE_BYTES = 512 * 1_024;
 const DEFAULT_MAX_RESPONSE_HEADER_BYTES = 32 * 1_024;
 const DEFAULT_DNS_CACHE_MS = 30_000;
 const DEFAULT_DNS_TIMEOUT_MS = 5_000;
+const DEFAULT_PUBLIC_DNS_ENDPOINT =
+  "https://cloudflare-dns.com/dns-query";
+const MAX_PUBLIC_DNS_RESPONSE_BYTES = 64 * 1_024;
 
 const PROTECTED_NETWORKS = createProtectedNetworkList();
+const PROXY_FAKE_IP_NETWORKS = createProxyFakeIpNetworkList();
 
 export class UpstreamSecurityError extends Error {
   constructor(message, options = {}) {
@@ -42,6 +46,7 @@ export function createSafeFetch(options = {}) {
   safeFetch.policy = Object.freeze({
     allowHttp: policy.allowHttp,
     allowPrivateNetworks: policy.allowPrivateNetworks,
+    proxyFakeIpFallback: policy.proxyFakeIpFallback,
     allowedHosts: [...policy.allowedHosts],
     allowedPorts: [...policy.allowedPorts],
     maxResponseBytes: policy.maxResponseBytes,
@@ -82,7 +87,7 @@ export async function resolveSafeTarget(input, options = {}) {
     );
   }
 
-  const addresses = await resolveAddresses(hostname, policy);
+  let addresses = await resolveAddresses(hostname, policy);
   if (addresses.length === 0) {
     throw new UpstreamSecurityError(
       "上游域名没有解析到可用地址。",
@@ -97,10 +102,20 @@ export async function resolveSafeTarget(input, options = {}) {
     !policy.allowPrivateNetworks &&
     addresses.some(({ address }) => !isPublicAddress(address))
   ) {
-    throw new UpstreamSecurityError(
-      "上游地址解析到了内网、回环、链路本地或保留网络，已阻止请求。",
-      { code: "private_upstream_blocked" },
-    );
+    if (
+      policy.proxyFakeIpFallback &&
+      !isIP(hostname) &&
+      addresses.every(({ address }) =>
+        isProxyFakeIpAddress(address),
+      )
+    ) {
+      addresses = await resolveProxyFakeIpTarget(hostname, policy);
+    } else {
+      throw new UpstreamSecurityError(
+        "上游地址解析到了内网、回环、链路本地或保留网络，已阻止请求。",
+        { code: "private_upstream_blocked" },
+      );
+    }
   }
 
   return {
@@ -124,6 +139,14 @@ export function isPublicAddress(value) {
   return false;
 }
 
+export function isProxyFakeIpAddress(value) {
+  const address = stripIpv6Brackets(String(value ?? "").trim());
+  return (
+    isIP(address) === 4 &&
+    PROXY_FAKE_IP_NETWORKS.check(address, "ipv4")
+  );
+}
+
 function normalizePolicy(options) {
   const allowHttp = options.allowHttp === true;
   const allowedPorts = new Set([
@@ -135,9 +158,13 @@ function normalizePolicy(options) {
   return {
     allowHttp,
     allowPrivateNetworks: options.allowPrivateNetworks === true,
+    proxyFakeIpFallback: options.proxyFakeIpFallback !== false,
     allowedHosts: normalizeHosts(options.allowedHosts),
     allowedPorts,
     resolver: options.resolver ?? dnsLookup,
+    publicResolver:
+      options.publicResolver ?? resolveWithPublicDnsOverHttps,
+    publicDnsFetch: options.publicDnsFetch ?? globalThis.fetch,
     now: options.now ?? (() => Date.now()),
     dnsCacheMs: finiteInteger(
       options.dnsCacheMs,
@@ -254,6 +281,66 @@ async function resolveAddresses(hostname, policy) {
     );
   }
 
+  const unique = normalizeAddressEntries(result);
+  policy.cache.set(hostname, {
+    addresses: unique,
+    expiresAt: now + policy.dnsCacheMs,
+  });
+  return unique;
+}
+
+async function resolveProxyFakeIpTarget(hostname, policy) {
+  let result;
+  try {
+    result = await withDeadline(
+      policy.publicResolver(hostname, {
+        fetch: policy.publicDnsFetch,
+        signal: policy.signal,
+      }),
+      policy,
+    );
+  } catch (error) {
+    if (
+      error instanceof UpstreamSecurityError &&
+      error.code === "upstream_dns_timeout"
+    ) {
+      throw error;
+    }
+    if (
+      error?.name === "AbortError" &&
+      policy.signal?.aborted
+    ) {
+      throw error;
+    }
+    throw new UpstreamSecurityError(
+      "检测到代理 Fake-IP，但公网 DNS 二次校验失败，已阻止请求。",
+      {
+        code: "proxy_fake_ip_dns_failed",
+        retryable: true,
+        cause: error,
+      },
+    );
+  }
+
+  const addresses = normalizeAddressEntries(result);
+  if (
+    addresses.length === 0 ||
+    addresses.some(({ address }) => !isPublicAddress(address))
+  ) {
+    throw new UpstreamSecurityError(
+      "检测到代理 Fake-IP，但未能验证对应的公网地址，已阻止请求。",
+      { code: "proxy_fake_ip_unverified" },
+    );
+  }
+
+  policy.cache.set(hostname, {
+    addresses,
+    expiresAt: policy.now() + policy.dnsCacheMs,
+  });
+  return addresses;
+}
+
+function normalizeAddressEntries(result) {
   const entries = (Array.isArray(result) ? result : [result])
     .map((entry) => ({
       address: stripIpv6Brackets(
@@ -268,7 +355,7 @@ async function resolveAddresses(hostname, policy) {
           (family === 6 && isIP(address) === 6)),
     );
 
-  const unique = [
+  return [
     ...new Map(
       entries.map((entry) => [
         `${entry.family}:${entry.address}`,
@@ -276,11 +363,75 @@ async function resolveAddresses(hostname, policy) {
       ]),
     ).values(),
   ];
-  policy.cache.set(hostname, {
-    addresses: unique,
-    expiresAt: now + policy.dnsCacheMs,
+}
+
+async function resolveWithPublicDnsOverHttps(
+  hostname,
+  options = {},
+) {
+  if (typeof options.fetch !== "function") {
+    throw new TypeError("当前运行环境不支持公网 DNS 校验。");
+  }
+
+  const queries = await Promise.allSettled(
+    [1, 28].map((type) =>
+      queryPublicDns(hostname, type, options),
+    ),
+  );
+  const fulfilled = queries.filter(
+    ({ status }) => status === "fulfilled",
+  );
+  if (fulfilled.length === 0) {
+    throw queries[0]?.reason ?? new Error("公网 DNS 查询失败。");
+  }
+  return fulfilled.flatMap(({ value }) => value);
+}
+
+async function queryPublicDns(hostname, type, options) {
+  const url = new URL(DEFAULT_PUBLIC_DNS_ENDPOINT);
+  url.searchParams.set("name", hostname);
+  url.searchParams.set("type", String(type));
+
+  const response = await options.fetch(url, {
+    headers: {
+      Accept: "application/dns-json",
+    },
+    redirect: "error",
+    signal: options.signal,
   });
-  return unique;
+  if (!response.ok) {
+    throw new Error(`公网 DNS 返回 HTTP ${response.status}。`);
+  }
+
+  const contentLength = Number(
+    response.headers.get("content-length"),
+  );
+  if (
+    Number.isFinite(contentLength) &&
+    contentLength > MAX_PUBLIC_DNS_RESPONSE_BYTES
+  ) {
+    throw new Error("公网 DNS 响应超过安全限制。");
+  }
+
+  const body = new Uint8Array(await response.arrayBuffer());
+  if (body.byteLength > MAX_PUBLIC_DNS_RESPONSE_BYTES) {
+    throw new Error("公网 DNS 响应超过安全限制。");
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    throw new Error("公网 DNS 返回了无效响应。");
+  }
+  if (payload?.Status !== 0) return [];
+
+  return (Array.isArray(payload.Answer) ? payload.Answer : [])
+    .filter((answer) => answer?.type === type)
+    .map((answer) => ({
+      address: String(answer?.data ?? "").trim(),
+      family: type === 1 ? 4 : 6,
+    }));
 }
 
 function withDeadline(promise, policy) {
@@ -575,5 +726,11 @@ function createProtectedNetworkList() {
   ]) {
     blockList.addSubnet(network, prefix, "ipv6");
   }
+  return blockList;
+}
+
+function createProxyFakeIpNetworkList() {
+  const blockList = new BlockList();
+  blockList.addSubnet("198.18.0.0", 15, "ipv4");
   return blockList;
 }
