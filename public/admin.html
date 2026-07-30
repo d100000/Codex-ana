@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="PlanScope 分析历史管理后台，仅保存域名和订阅分布汇总。"
+    />
+    <title>管理后台 · PlanScope</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/admin.css" />
+    <script src="/admin.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#admin-content">跳到管理记录</a>
+
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="返回 PlanScope 分析页">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+        <span>
+          <strong>PlanScope</strong>
+          <small>管理后台</small>
+        </span>
+      </a>
+      <div class="topbar-meta">
+        <span class="local-dot" aria-hidden="true"></span>
+        <span>隐私汇总记录</span>
+        <span class="topbar-rule" aria-hidden="true"></span>
+        <span>不保存 API KEY</span>
+        <a class="topbar-link" href="/">
+          返回分析 <span aria-hidden="true">←</span>
+        </a>
+      </div>
+    </header>
+
+    <main class="admin-shell" id="admin-content">
+      <header class="admin-page-heading">
+        <div>
+          <p class="eyebrow">ADMIN CONSOLE / 01</p>
+          <h1>分析历史</h1>
+          <p>
+            按分析任务查看接口域名、运行结果和动态订阅等级占比。
+            历史文件不包含 API key、完整接口路径、查询参数或单条响应证据。
+          </p>
+        </div>
+        <span class="privacy-badge">
+          <span aria-hidden="true">◆</span>
+          最小化记录
+        </span>
+      </header>
+
+      <section
+        class="admin-loading panel"
+        id="admin-loading"
+        aria-live="polite"
+      >
+        <span class="admin-spinner" aria-hidden="true"></span>
+        <div>
+          <strong>正在确认管理会话</strong>
+          <p>检查本机服务与访问权限…</p>
+        </div>
+      </section>
+
+      <section class="admin-login panel" id="admin-login" hidden>
+        <div class="admin-login-copy">
+          <p class="eyebrow">SECURE ACCESS / 02</p>
+          <h2>管理员登录</h2>
+          <p id="admin-login-description">
+            输入启动服务时配置的管理密码。密码只用于本次登录验证，
+            不会写入浏览器存储或分析历史。
+          </p>
+        </div>
+        <form id="admin-login-form">
+          <label for="admin-password">管理密码</label>
+          <div class="admin-password-frame">
+            <span aria-hidden="true">PASS</span>
+            <input
+              id="admin-password"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              spellcheck="false"
+              minlength="16"
+              required
+            />
+            <button
+              id="admin-password-toggle"
+              type="button"
+              aria-label="显示管理密码"
+              aria-pressed="false"
+            >
+              显示
+            </button>
+          </div>
+          <button class="admin-login-button" id="admin-login-button" type="submit">
+            登录管理后台
+          </button>
+          <p class="admin-form-message" id="admin-login-message" role="alert"></p>
+        </form>
+      </section>
+
+      <section id="admin-dashboard" hidden>
+        <section class="admin-metrics" aria-label="历史统计">
+          <article>
+            <span>历史任务</span>
+            <strong id="metric-total">0</strong>
+            <p>当前保留的汇总记录</p>
+          </article>
+          <article>
+            <span>接口域名</span>
+            <strong id="metric-domains">0</strong>
+            <p>按规范化域名去重</p>
+          </article>
+          <article>
+            <span>完成任务</span>
+            <strong id="metric-completed">0</strong>
+            <p id="metric-completed-copy">失败 0 · 取消 0</p>
+          </article>
+          <article>
+            <span>近 24 小时</span>
+            <strong id="metric-recent">0</strong>
+            <p>新增分析记录</p>
+          </article>
+        </section>
+
+        <section class="admin-history panel">
+          <div class="admin-history-heading">
+            <div>
+              <p class="eyebrow">HISTORY INDEX / 03</p>
+              <h2>接口分析记录</h2>
+              <p id="history-count">正在读取记录…</p>
+            </div>
+            <div class="admin-session-actions">
+              <button id="admin-refresh" type="button">刷新</button>
+              <button id="admin-logout" type="button">退出登录</button>
+            </div>
+          </div>
+
+          <form class="admin-filters" id="admin-filters">
+            <label>
+              <span>搜索域名或模型</span>
+              <input
+                id="history-query"
+                type="search"
+                placeholder="例如 api.example.com"
+                autocomplete="off"
+              />
+            </label>
+            <label>
+              <span>任务状态</span>
+              <select id="history-status">
+                <option value="">全部状态</option>
+                <option value="completed">已完成</option>
+                <option value="failed">失败</option>
+                <option value="cancelled">已取消</option>
+              </select>
+            </label>
+          </form>
+
+          <div class="admin-notice" id="admin-error" role="alert" hidden>
+            <strong>记录读取失败</strong>
+            <span id="admin-error-copy"></span>
+          </div>
+
+          <div class="admin-table-wrap">
+            <table class="admin-table">
+              <thead>
+                <tr>
+                  <th scope="col">分析时间</th>
+                  <th scope="col">接口域名</th>
+                  <th scope="col">模型</th>
+                  <th scope="col">结果</th>
+                  <th scope="col">订阅等级占比</th>
+                  <th scope="col">样本</th>
+                  <th scope="col">耗时</th>
+                  <th scope="col"><span class="sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody id="history-body">
+                <tr>
+                  <td colspan="8" class="admin-table-state">正在读取历史记录…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="admin-pagination">
+            <span id="history-loaded">已加载 0 条</span>
+            <button id="history-more" type="button" hidden>
+              加载更多
+            </button>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <dialog
+      class="history-dialog"
+      id="history-dialog"
+      aria-labelledby="history-dialog-title"
+      aria-describedby="history-dialog-subtitle"
+    >
+      <form method="dialog">
+        <button
+          class="history-dialog-close"
+          aria-label="关闭详情"
+          value="close"
+        >
+          ×
+        </button>
+      </form>
+      <div class="history-dialog-heading">
+        <p class="eyebrow">RUN DETAIL / 04</p>
+        <h2 id="history-dialog-title">分析详情</h2>
+        <p id="history-dialog-subtitle"></p>
+      </div>
+      <dl class="history-detail-grid" id="history-detail-grid"></dl>
+      <section class="history-distribution">
+        <h3>订阅等级占比</h3>
+        <div id="history-distribution"></div>
+      </section>
+      <p class="history-dialog-note">
+        百分比分母是该次任务计划的逻辑样本总数；此处仅展示汇总，
+        不保存任何 API key 或原始响应。
+      </p>
+    </dialog>
+  </body>
+</html>

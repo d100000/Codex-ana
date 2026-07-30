@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
 import { request } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT_DIR = fileURLToPath(new URL("..", import.meta.url));
 const PORT = Number(process.env.INTEGRATION_PORT || 4397);
+const ADMIN_PASSWORD = "integration-admin-password";
+const TEST_DATA_DIR = await mkdtemp(
+  join(tmpdir(), "planscope-security-"),
+);
 const child = spawn(process.execPath, ["server.mjs"], {
   cwd: ROOT_DIR,
   env: {
@@ -13,6 +20,9 @@ const child = spawn(process.execPath, ["server.mjs"], {
     PORT: String(PORT),
     ALLOW_HTTP_UPSTREAMS: "",
     ALLOW_PRIVATE_UPSTREAMS: "",
+    ADMIN_PASSWORD,
+    ADMIN_SESSION_SECRET: "s".repeat(32),
+    PLANSCOPE_DATA_DIR: join(TEST_DATA_DIR, "primary"),
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -31,6 +41,7 @@ try {
     health.headers["content-security-policy"],
     /object-src 'none'/,
   );
+  assert.equal(health.json.protection.adminHistory.enabled, true);
 
   const rebinding = await send({
     headers: { Host: `attacker.example:${PORT}` },
@@ -103,6 +114,54 @@ try {
     "private_upstream_blocked",
   );
 
+  const adminSession = await send({
+    path: "/api/admin/session",
+  });
+  assert.equal(adminSession.status, 200);
+  assert.equal(adminSession.json.enabled, true);
+  assert.equal(adminSession.json.authenticated, false);
+  const adminDeviceCookie = cookieByName(
+    adminSession.headers["set-cookie"],
+    "planscope_device",
+  );
+
+  const unauthenticatedHistory = await send({
+    path: "/api/admin/history",
+    headers: { Cookie: adminDeviceCookie },
+  });
+  assert.equal(unauthenticatedHistory.status, 401);
+  assert.equal(
+    unauthenticatedHistory.json.error.code,
+    "admin_authentication_required",
+  );
+
+  const adminLogin = await send({
+    method: "POST",
+    path: "/api/admin/login",
+    headers: jsonHeaders(adminDeviceCookie),
+    body: JSON.stringify({ password: ADMIN_PASSWORD }),
+  });
+  assert.equal(adminLogin.status, 200);
+  const adminCookie = cookieByName(
+    adminLogin.headers["set-cookie"],
+    "planscope_admin",
+  );
+  const authenticatedCookies =
+    `${adminDeviceCookie}; ${adminCookie}`;
+
+  const emptyHistory = await send({
+    path: "/api/admin/history",
+    headers: { Cookie: authenticatedCookies },
+  });
+  assert.equal(emptyHistory.status, 200);
+  assert.deepEqual(emptyHistory.json.records, []);
+
+  const foreignAdminDevice = await send({
+    path: "/api/admin/history",
+    headers: { Cookie: adminCookie },
+  });
+  assert.equal(foreignAdminDevice.status, 401);
+
   console.log(
     JSON.stringify({
       health: health.status,
@@ -113,6 +172,9 @@ try {
       challenge: challenge.status,
       privateTarget: privateTarget.status,
       privateTargetCode: privateTarget.json.error.code,
+      adminLogin: adminLogin.status,
+      adminHistory: emptyHistory.status,
+      foreignAdminDevice: foreignAdminDevice.status,
     }),
   );
 } finally {
@@ -120,7 +182,11 @@ try {
   await waitForExit(child);
 }
 
-await verifyJobOwnership();
+try {
+  await verifyJobOwnership();
+} finally {
+  await rm(TEST_DATA_DIR, { recursive: true, force: true });
+}
 
 function send(options = {}) {
   const body = String(options.body ?? "");
@@ -180,6 +246,9 @@ async function verifyJobOwnership() {
       ALLOW_HTTP_UPSTREAMS: "1",
       ALLOW_PRIVATE_UPSTREAMS: "1",
       ALLOWED_UPSTREAM_PORTS: String(mockPort),
+      ADMIN_PASSWORD,
+      ADMIN_SESSION_SECRET: "s".repeat(32),
+      PLANSCOPE_DATA_DIR: join(TEST_DATA_DIR, "ownership"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -266,12 +335,43 @@ async function verifyJobOwnership() {
     });
     assert.equal(ownerCancel.status, 200);
 
+    const adminLogin = await send({
+      port: appPort,
+      method: "POST",
+      path: "/api/admin/login",
+      headers: jsonHeaders(ownerCookie),
+      body: JSON.stringify({ password: ADMIN_PASSWORD }),
+    });
+    assert.equal(adminLogin.status, 200);
+    const adminCookie = cookieByName(
+      adminLogin.headers["set-cookie"],
+      "planscope_admin",
+    );
+    const history = await waitForHistory(
+      appPort,
+      `${ownerCookie}; ${adminCookie}`,
+    );
+    assert.equal(history.status, 200);
+    assert.equal(
+      history.json.records[0].domain,
+      `localhost:${mockPort}`,
+    );
+    assert.ok(
+      ["completed", "cancelled"].includes(
+        history.json.records[0].status,
+      ),
+    );
+    assert.doesNotMatch(history.text, /sk-test-local/);
+    assert.doesNotMatch(history.text, /apiKey/);
+
     console.log(
       JSON.stringify({
         ownerRead: ownerRead.status,
         foreignRead: foreignRead.status,
         foreignCancel: foreignCancel.status,
         ownerCancel: ownerCancel.status,
+        historyRecord: history.status,
+        historyDomain: history.json.records[0].domain,
       }),
     );
   } finally {
@@ -279,6 +379,19 @@ async function verifyJobOwnership() {
     mock.kill("SIGTERM");
     await Promise.all([waitForExit(app), waitForExit(mock)]);
   }
+}
+
+async function waitForHistory(port, cookie) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const response = await send({
+      port,
+      path: "/api/admin/history?limit=10",
+      headers: { Cookie: cookie },
+    });
+    if (response.json?.records?.length > 0) return response;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("等待分析历史写入超时。");
 }
 
 function waitForReady(process) {
@@ -333,6 +446,17 @@ function waitForExit(process) {
 
 function cookiePair(setCookie) {
   return String(setCookie).split(";")[0];
+}
+
+function cookieByName(setCookies, name) {
+  const values = Array.isArray(setCookies)
+    ? setCookies
+    : [setCookies];
+  const match = values
+    .map(cookiePair)
+    .find((cookie) => cookie.startsWith(`${name}=`));
+  assert.ok(match, `缺少 ${name} Cookie`);
+  return match;
 }
 
 function parseJson(text) {

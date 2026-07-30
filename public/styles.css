@@ -202,6 +202,32 @@ code {
   background: var(--line-strong);
 }
 
+.topbar-link {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 5px;
+  padding: 0 10px;
+  color: var(--blue);
+  border: 1px solid rgba(49, 91, 232, 0.24);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.74);
+  font-family: var(--font-ui);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-decoration: none;
+  text-transform: none;
+  white-space: nowrap;
+}
+
+.topbar-link:hover {
+  color: var(--blue-dark);
+  border-color: rgba(49, 91, 232, 0.42);
+  background: #fff;
+}
+
 .app-shell {
   width: min(1580px, 100%);
   min-height: calc(100vh - 72px);

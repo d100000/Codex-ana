@@ -62,6 +62,35 @@ FORWARDED_IP_HEADER=x-real-ip \
 npm start
 ```
 
+## 管理后台与历史记录
+
+分析页右上角提供“管理后台”入口，也可以直接打开 `/admin`。后台按一次分析任务保存一条汇总记录，可查看：
+
+- 分析时间、规范化接口域名、所选模型和任务状态
+- 完成、识别、未识别、失败样本数，累计尝试、平均响应和任务耗时
+- 接口实际返回的全部动态 tier 及其百分比，不限制为 Pro、Plus 等固定名称
+- 按域名或模型搜索、按任务状态筛选、分页和单次任务详情
+
+历史记录遵循最小化原则。持久化文件**不会保存** API Key、完整接口路径、URL 查询参数、任务 ID、原始响应、逐次样本证据或错误原文。只从已经脱敏的任务汇总中提取白名单字段，接口地址最终只保留 Origin 和域名。
+
+默认历史文件为 `.data/analysis-history.json`，目录已加入 `.gitignore`；文件权限为 `0600`，写入时使用同目录临时文件和原子替换。默认最多保留 5,000 条，可通过以下变量调整：
+
+```bash
+PLANSCOPE_DATA_DIR=/var/lib/planscope \
+MAX_HISTORY_RECORDS=10000 \
+npm start
+```
+
+本机模式未配置密码时，每次启动会生成一个临时管理密码并打印在当前终端，服务重启后密码会变化。建议固定配置至少 16 字节的密码：
+
+```bash
+ADMIN_PASSWORD='请替换为长随机密码' \
+ADMIN_SESSION_SECRET='请替换为至少 32 字节的随机值' \
+npm start
+```
+
+管理员会话保存在 `HttpOnly`、`SameSite=Strict` Cookie 中，有效期 8 小时，并与当前匿名设备绑定。连续 5 次登录失败后，IP 和设备两个维度都会进入 15 分钟限制。公网模式不会生成临时密码；未配置 `ADMIN_PASSWORD` 时管理登录保持禁用。生产环境应通过密钥管理服务注入密码和会话签名密钥，不要把它们提交到仓库。
+
 ## 上游网络安全
 
 所有携带 API Key 的上游请求都会经过专用安全请求器：
@@ -102,7 +131,7 @@ npm start
 npm start
 ```
 
-打开 <http://127.0.0.1:4317>，填写接口地址和 API Key，读取并选择模型后开始分析。
+打开 <http://127.0.0.1:4317>，填写接口地址和 API Key，读取并选择模型后开始分析。管理后台位于 <http://127.0.0.1:4317/admin>；本机自动生成的管理密码会显示在启动终端。
 
 ## 本地演示
 
@@ -134,7 +163,7 @@ npm start
 npm run check
 ```
 
-测试覆盖 URL 归一化、模型推荐与复核、字段优先级、额度证据提取、百分比分母、并发上限、随机重试、私网地址识别、DNS 固定、跨站防护和接口限流。自动化测试只调用内存模拟接口，不会使用真实 API Key 或消耗上游额度。
+测试覆盖 URL 归一化、模型推荐与复核、字段优先级、额度证据提取、百分比分母、并发上限、随机重试、私网地址识别、DNS 固定、跨站防护、接口限流、管理员会话、登录失败限制、历史记录原子持久化和敏感字段排除。自动化测试只调用内存模拟接口，不会使用真实 API Key 或消耗上游额度。
 
 需要监听本机测试端口的完整安全集成测试：
 
@@ -142,7 +171,7 @@ npm run check
 npm run test:security
 ```
 
-它会验证 DNS 重绑定 Host、跨站请求、错误 Content-Type、云元数据地址拦截，以及任务的设备访问隔离。
+它会验证 DNS 重绑定 Host、跨站请求、错误 Content-Type、云元数据地址拦截、任务的设备访问隔离、管理会话的设备绑定，以及分析完成后历史接口只返回规范化域名且不包含 API Key。
 
 ## 密钥与部署安全
 
@@ -154,6 +183,7 @@ npm run test:security
 - 非本机监听默认必须配置 HTTPS 的 `PUBLIC_ORIGIN`，否则服务拒绝启动；直连 HTTP 也会返回 `426`。反向代理必须从受信地址发送 `X-Forwarded-Proto: https`，`ALLOWED_HOSTS` 可用于补充精确 Host 别名。
 - 公网部署建议同时设置 `ALLOWED_UPSTREAM_HOSTS`，并在入口继续配置 HTTPS、认证、CDN/WAF 限流和请求日志脱敏。
 - 当前挑战、限流和任务状态仍保存在单进程内存中；多实例部署必须迁移到 Redis 等共享存储。
+- 分析历史保存在本地 JSON 文件中。多实例部署应改用带访问控制的共享数据库，并在应用层继续沿用当前最小化字段模型。
 - 100 个逻辑样本在极端情况下最多产生 500 次 Responses 请求，请先确认额度、费率限制和服务条款。
 
 公网反向代理示例：
@@ -165,6 +195,9 @@ TRUST_PROXY=1 \
 TRUSTED_PROXY_IPS=127.0.0.1 \
 FORWARDED_IP_HEADER=x-real-ip \
 ABUSE_SECRET='至少 32 字节的随机值' \
+ADMIN_PASSWORD='至少 16 字节的长随机密码' \
+ADMIN_SESSION_SECRET='至少 32 字节的随机值' \
+PLANSCOPE_DATA_DIR=/var/lib/planscope \
 ALLOWED_UPSTREAM_HOSTS=api.example.com \
 npm start
 ```

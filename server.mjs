@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   createHmac,
@@ -8,6 +8,13 @@ import {
   randomUUID,
 } from "node:crypto";
 import { isIP } from "node:net";
+import {
+  AdminAuth,
+  DEFAULT_ADMIN_AUTH_CONFIG,
+} from "./src/admin-auth.mjs";
+import {
+  AdminHistoryStore,
+} from "./src/admin-history.mjs";
 import {
   AbuseProtection,
   DEFAULT_PROTECTION_CONFIG,
@@ -49,6 +56,11 @@ const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN ?? "";
 const DEVICE_COOKIE = /^https:\/\//i.test(PUBLIC_ORIGIN.trim())
   ? "__Host-planscope_device"
   : "planscope_device";
+const ADMIN_SESSION_COOKIE = /^https:\/\//i.test(
+  PUBLIC_ORIGIN.trim(),
+)
+  ? "__Host-planscope_admin"
+  : "planscope_admin";
 const DEVICE_COOKIE_MAX_AGE = 365 * 24 * 60 * 60;
 const MAX_ACTIVE_JOBS = readIntegerEnv("MAX_ACTIVE_JOBS", 2, 1, 20);
 const MAX_STORED_JOBS = readIntegerEnv(
@@ -69,7 +81,26 @@ const MAX_CONCURRENT_MODEL_LOOKUPS = readIntegerEnv(
   1,
   20,
 );
+const MAX_HISTORY_RECORDS = readIntegerEnv(
+  "MAX_HISTORY_RECORDS",
+  5_000,
+  100,
+  20_000,
+);
+const DATA_DIR = resolve(
+  ROOT_DIR,
+  process.env.PLANSCOPE_DATA_DIR || ".data",
+);
 const identitySecret = readIdentitySecret();
+const adminPasswordConfig = readAdminPassword();
+const adminAuth = new AdminAuth({
+  password: adminPasswordConfig.password,
+  secret: readAdminSessionSecret(),
+});
+const adminHistory = await new AdminHistoryStore({
+  filePath: join(DATA_DIR, "analysis-history.json"),
+  maxRecords: MAX_HISTORY_RECORDS,
+}).init();
 const abuseProtection = new AbuseProtection();
 const requestSecurity = createRequestSecurity({
   bindHost: HOST,
@@ -98,8 +129,13 @@ let activeModelLookups = 0;
 const staticRoutes = new Map([
   ["/", "index.html"],
   ["/index.html", "index.html"],
+  ["/admin", "admin.html"],
+  ["/admin/", "admin.html"],
+  ["/admin.html", "admin.html"],
   ["/styles.css", "styles.css"],
   ["/app.js", "app.js"],
+  ["/admin.css", "admin.css"],
+  ["/admin.js", "admin.js"],
 ]);
 
 class ServiceError extends Error {
@@ -142,8 +178,87 @@ const server = createServer(async (request, response) => {
           privateUpstreamsAllowed:
             upstreamFetch.policy.allowPrivateNetworks,
           maxActiveJobs: MAX_ACTIVE_JOBS,
+          adminHistory: {
+            enabled: adminAuth.enabled,
+            maxRecords: MAX_HISTORY_RECORDS,
+          },
         },
       });
+      return;
+    }
+
+    if (
+      request.method === "GET" &&
+      pathname === "/api/admin/session"
+    ) {
+      const identity = identifyClient(request, response);
+      const authenticated =
+        adminAuth.enabled &&
+        adminAuth.verifySession(
+          parseCookies(request.headers.cookie).get(
+            ADMIN_SESSION_COOKIE,
+          ),
+          identity.deviceKey,
+        );
+      sendJson(response, 200, {
+        enabled: adminAuth.enabled,
+        authenticated,
+        sessionTtlSeconds:
+          DEFAULT_ADMIN_AUTH_CONFIG.sessionTtlMs / 1_000,
+      });
+      return;
+    }
+
+    if (
+      request.method === "POST" &&
+      pathname === "/api/admin/login"
+    ) {
+      assertJsonRequest(request);
+      const body = await readJsonBody(request);
+      const identity = identifyClient(request, response);
+      const session = adminAuth.createSession({
+        password: body?.password,
+        ...identity,
+      });
+      appendSetCookie(
+        response,
+        serializeAdminCookie(session.token, request, {
+          maxAge: session.expiresInSeconds,
+        }),
+      );
+      sendJson(response, 200, {
+        authenticated: true,
+        expiresAt: new Date(session.expiresAt).toISOString(),
+      });
+      return;
+    }
+
+    if (
+      request.method === "POST" &&
+      pathname === "/api/admin/logout"
+    ) {
+      assertEmptyRequest(request);
+      identifyClient(request, response);
+      appendSetCookie(
+        response,
+        serializeAdminCookie("", request, { maxAge: 0 }),
+      );
+      sendJson(response, 200, { authenticated: false });
+      return;
+    }
+
+    if (
+      request.method === "GET" &&
+      pathname === "/api/admin/history"
+    ) {
+      requireAdminSession(request, response);
+      const result = adminHistory.list({
+        offset: url.searchParams.get("offset"),
+        limit: url.searchParams.get("limit"),
+        query: url.searchParams.get("q"),
+        status: url.searchParams.get("status"),
+      });
+      sendJson(response, 200, result);
       return;
     }
 
@@ -413,6 +528,14 @@ async function runJob(job, credentials) {
     job.updatedAt = new Date().toISOString();
     // Ensure credentials cannot remain reachable after the task finishes.
     credentials.apiKey = "";
+    try {
+      await adminHistory.record(job);
+    } catch (error) {
+      console.error("Analysis history write failed:", {
+        name: error?.name,
+        code: error?.code,
+      });
+    }
     broadcast(job, true);
     setTimeout(() => {
       const current = jobs.get(job.id);
@@ -689,8 +812,8 @@ function identifyClient(request, response) {
   let deviceId = cookies.get(DEVICE_COOKIE);
   if (!/^[A-Za-z0-9_-]{32}$/.test(deviceId ?? "")) {
     deviceId = randomBytes(24).toString("base64url");
-    response.setHeader(
-      "Set-Cookie",
+    appendSetCookie(
+      response,
       serializeDeviceCookie(deviceId, request),
     );
   }
@@ -781,6 +904,51 @@ function serializeDeviceCookie(deviceId, request) {
   return attributes.join("; ");
 }
 
+function serializeAdminCookie(token, request, { maxAge }) {
+  const attributes = [
+    `${ADMIN_SESSION_COOKIE}=${token}`,
+    "Path=/",
+    `Max-Age=${Math.max(0, Math.trunc(maxAge))}`,
+    "HttpOnly",
+    "SameSite=Strict",
+    "Priority=High",
+  ];
+  if (maxAge === 0) {
+    attributes.push("Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+  }
+  if (applicationRequestIsSecure(request)) {
+    attributes.push("Secure");
+  }
+  return attributes.join("; ");
+}
+
+function appendSetCookie(response, value) {
+  const current = response.getHeader("Set-Cookie");
+  if (!current) {
+    response.setHeader("Set-Cookie", value);
+    return;
+  }
+  response.setHeader(
+    "Set-Cookie",
+    Array.isArray(current) ? [...current, value] : [current, value],
+  );
+}
+
+function requireAdminSession(request, response) {
+  adminAuth.assertEnabled();
+  const identity = identifyClient(request, response);
+  const token = parseCookies(request.headers.cookie).get(
+    ADMIN_SESSION_COOKIE,
+  );
+  if (adminAuth.verifySession(token, identity.deviceKey)) {
+    return identity;
+  }
+  throw new ServiceError("请先登录管理后台。", {
+    code: "admin_authentication_required",
+    httpStatus: 401,
+  });
+}
+
 function hashIdentity(kind, value) {
   return createHmac("sha256", identitySecret)
     .update(`${kind}:${value}`)
@@ -823,6 +991,44 @@ function readIdentitySecret() {
   return configured;
 }
 
+function readAdminPassword() {
+  const configured = String(process.env.ADMIN_PASSWORD ?? "");
+  if (configured) {
+    if (
+      Buffer.byteLength(configured) < 16 ||
+      Buffer.byteLength(configured) > 256 ||
+      /[\u0000-\u001f\u007f]/.test(configured)
+    ) {
+      throw new Error(
+        "ADMIN_PASSWORD 必须是 16–256 字节且不能包含控制字符。",
+      );
+    }
+    return { password: configured, generated: false };
+  }
+
+  const localOnly = ["127.0.0.1", "::1", "localhost"].includes(
+    HOST.trim().toLowerCase(),
+  );
+  if (localOnly && !PUBLIC_ORIGIN.trim()) {
+    return {
+      password: randomBytes(18).toString("base64url"),
+      generated: true,
+    };
+  }
+  return { password: null, generated: false };
+}
+
+function readAdminSessionSecret() {
+  const configured = process.env.ADMIN_SESSION_SECRET;
+  if (!configured) return randomBytes(32);
+  if (Buffer.byteLength(configured) < 32) {
+    throw new Error(
+      "ADMIN_SESSION_SECRET 必须至少包含 32 字节。",
+    );
+  }
+  return configured;
+}
+
 function readForwardedIpHeader() {
   const header = String(
     process.env.FORWARDED_IP_HEADER ?? "x-real-ip",
@@ -859,6 +1065,15 @@ server.listen(PORT, HOST, () => {
   console.log(
     `网络保护：SSRF 防护已启用 / ${upstreamFetch.policy.allowHttp ? "允许显式 HTTP" : "仅 HTTPS"} / 最大并行任务 ${MAX_ACTIVE_JOBS}`,
   );
+  if (adminPasswordConfig.generated) {
+    console.log(
+      `本次启动管理密码：${adminPasswordConfig.password}`,
+    );
+  } else {
+    console.log(
+      `管理后台：${adminAuth.enabled ? "已启用" : "未配置 ADMIN_PASSWORD，已禁用登录"}`,
+    );
+  }
 });
 
 function shutdown() {
