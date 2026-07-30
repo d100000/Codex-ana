@@ -158,6 +158,12 @@
           <button class="secondary-action" id="cancel-button" type="button" hidden>
             停止当前分析
           </button>
+          <p class="protection-note" id="protection-note">
+            <span aria-hidden="true">◆</span>
+            <span id="protection-copy">
+              启动前需完成滑块验证；同一 IP 或设备每 5 分钟仅可分析一次。
+            </span>
+          </p>
         </form>
 
         <p class="quota-note">
@@ -372,5 +378,64 @@
         </footer>
       </section>
     </main>
+
+    <div class="verification-overlay" id="verification-overlay" hidden>
+      <section
+        class="verification-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="verification-title"
+        aria-describedby="verification-description"
+      >
+        <button
+          class="verification-close"
+          id="verification-close"
+          type="button"
+          aria-label="关闭滑块验证"
+        >
+          ×
+        </button>
+        <div class="verification-heading">
+          <span class="verification-shield" aria-hidden="true">◇</span>
+          <div>
+            <p class="eyebrow">HUMAN CHECK / 06</p>
+            <h2 id="verification-title">完成滑块验证</h2>
+          </div>
+        </div>
+        <p id="verification-description">
+          按住滑块，平稳拖动到蓝色缺口位置。验证结果只可使用一次。
+        </p>
+
+        <div class="verification-track" id="verification-track">
+          <span class="verification-fill" id="verification-fill"></span>
+          <span
+            class="verification-target"
+            id="verification-target"
+            aria-hidden="true"
+          ></span>
+          <input
+            id="verification-slider"
+            type="range"
+            min="0"
+            max="1000"
+            step="5"
+            value="0"
+            aria-label="拖动滑块与验证缺口对齐"
+          />
+        </div>
+
+        <p
+          class="verification-status"
+          id="verification-status"
+          aria-live="polite"
+        >
+          从最左侧开始拖动
+        </p>
+        <div class="verification-footer">
+          <span>IP + 匿名设备双重限流</span>
+          <button id="verification-cancel" type="button">取消</button>
+        </div>
+      </section>
+    </div>
   </body>
 </html>

@@ -44,6 +44,15 @@ const elements = {
   modelStatus: document.querySelector("#model-status"),
   startButton: document.querySelector("#start-button"),
   cancelButton: document.querySelector("#cancel-button"),
+  protectionCopy: document.querySelector("#protection-copy"),
+  verificationOverlay: document.querySelector("#verification-overlay"),
+  verificationClose: document.querySelector("#verification-close"),
+  verificationCancel: document.querySelector("#verification-cancel"),
+  verificationSlider: document.querySelector("#verification-slider"),
+  verificationTrack: document.querySelector("#verification-track"),
+  verificationFill: document.querySelector("#verification-fill"),
+  verificationTarget: document.querySelector("#verification-target"),
+  verificationStatus: document.querySelector("#verification-status"),
   statusBadge: document.querySelector("#status-badge"),
   jobId: document.querySelector("#job-id"),
   stageTitle: document.querySelector("#stage-title"),
@@ -94,6 +103,16 @@ let analysisBusy = false;
 let modelLoading = false;
 let modelsReady = false;
 let modelListSource = null;
+let verificationOpen = false;
+let verificationBusy = false;
+let verificationChallenge = null;
+let verificationTrace = [];
+let verificationStartedAt = null;
+let verificationSession = 0;
+let verificationReturnFocus = null;
+let pendingAnalysis = null;
+let cooldownUntil = 0;
+let cooldownTimer = null;
 
 initialize();
 
@@ -165,6 +184,39 @@ function wireInteractions() {
   elements.modelSelect.addEventListener("change", handleModelChange);
   elements.baseUrl.addEventListener("input", invalidateModelSelection);
   elements.apiKey.addEventListener("input", invalidateModelSelection);
+  elements.verificationClose.addEventListener(
+    "click",
+    closeVerification,
+  );
+  elements.verificationCancel.addEventListener(
+    "click",
+    closeVerification,
+  );
+  elements.verificationOverlay.addEventListener(
+    "click",
+    handleVerificationBackdrop,
+  );
+  elements.verificationOverlay.addEventListener(
+    "keydown",
+    handleVerificationKeydown,
+  );
+  elements.verificationSlider.addEventListener(
+    "pointerdown",
+    beginVerificationTrace,
+  );
+  elements.verificationSlider.addEventListener(
+    "keydown",
+    beginKeyboardVerificationTrace,
+  );
+  elements.verificationSlider.addEventListener(
+    "input",
+    recordVerificationTrace,
+  );
+  elements.verificationSlider.addEventListener(
+    "change",
+    submitVerification,
+  );
+  window.addEventListener("resize", positionVerificationVisuals);
   elements.dismissError.addEventListener("click", hideError);
   elements.recordFilter.addEventListener("change", renderRecords);
   elements.exportJson.addEventListener("click", exportJson);
@@ -313,6 +365,365 @@ function setModelStatus(message, stateClass = "") {
     `field-hint model-status ${stateClass}`.trim();
 }
 
+async function openVerification() {
+  const session = ++verificationSession;
+  verificationReturnFocus = document.activeElement;
+  verificationOpen = true;
+  verificationBusy = true;
+  elements.verificationOverlay.hidden = false;
+  document.body.classList.add("is-verifying");
+  syncControls();
+  elements.verificationClose.focus();
+  await loadVerificationChallenge(session);
+}
+
+async function loadVerificationChallenge(
+  session,
+  retryMessage = "",
+) {
+  verificationBusy = true;
+  verificationChallenge = null;
+  verificationTrace = [];
+  verificationStartedAt = null;
+  elements.verificationSlider.value = "0";
+  elements.verificationSlider.disabled = true;
+  elements.verificationTrack.className = "verification-track";
+  positionVerificationVisuals();
+  setVerificationStatus(
+    retryMessage
+      ? `${retryMessage} 正在刷新验证…`
+      : "正在生成一次性验证…",
+    retryMessage ? "is-error" : "is-checking",
+  );
+  syncControls();
+
+  try {
+    if (retryMessage) {
+      await new Promise((resolve) => window.setTimeout(resolve, 550));
+    }
+    if (session !== verificationSession || !verificationOpen) return;
+
+    const response = await fetch("/api/verification/challenge", {
+      method: "POST",
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw apiErrorFromPayload(
+        payload,
+        "无法创建滑块验证。",
+        response.status,
+      );
+    }
+    if (session !== verificationSession || !verificationOpen) return;
+
+    const target = Number(payload?.target);
+    if (!Number.isFinite(target) || target < 0 || target > 1_000) {
+      throw new Error("本地服务返回了无效的滑块位置。");
+    }
+
+    verificationChallenge = {
+      id: String(payload.id),
+      target,
+      tolerance: Number(payload.tolerance) || 40,
+    };
+    verificationBusy = false;
+    elements.verificationSlider.disabled = false;
+    elements.verificationTrack.className = "verification-track";
+    positionVerificationVisuals();
+    setVerificationStatus(
+      retryMessage
+        ? "验证已刷新，请从左侧重新拖动"
+        : "从最左侧开始拖动",
+    );
+    syncControls();
+    elements.verificationSlider.focus();
+  } catch (error) {
+    if (session !== verificationSession || !verificationOpen) return;
+    if (error?.retryAfterSeconds) {
+      beginCooldown(
+        Date.now() + error.retryAfterSeconds * 1_000,
+      );
+    }
+    closeVerification();
+    showError(
+      error?.code === "rate_limited"
+        ? "仍在安全冷却"
+        : "无法开始验证",
+      error?.message || "无法连接本地验证服务。",
+    );
+  }
+}
+
+function beginVerificationTrace() {
+  if (verificationBusy || !verificationChallenge) return;
+  verificationStartedAt = performance.now();
+  verificationTrace = [
+    [Number(elements.verificationSlider.value), 0],
+  ];
+  elements.verificationTrack.className = "verification-track";
+  setVerificationStatus("正在记录拖动轨迹…");
+}
+
+function beginKeyboardVerificationTrace(event) {
+  if (
+    ![
+      "ArrowLeft",
+      "ArrowRight",
+      "Home",
+      "End",
+      "PageUp",
+      "PageDown",
+    ].includes(event.key)
+  ) {
+    return;
+  }
+  if (verificationStartedAt === null) beginVerificationTrace();
+}
+
+function recordVerificationTrace() {
+  if (verificationBusy || !verificationChallenge) return;
+  if (verificationStartedAt === null) beginVerificationTrace();
+
+  const position = Number(elements.verificationSlider.value);
+  const elapsed = Math.max(
+    0,
+    Math.round((performance.now() - verificationStartedAt) * 10) / 10,
+  );
+  const previous = verificationTrace.at(-1);
+  if (
+    verificationTrace.length < 180 &&
+    (!previous ||
+      previous[0] !== position ||
+      elapsed - previous[1] >= 16)
+  ) {
+    verificationTrace.push([position, elapsed]);
+  }
+  positionVerificationVisuals();
+}
+
+async function submitVerification() {
+  if (
+    verificationBusy ||
+    !verificationChallenge ||
+    verificationStartedAt === null
+  ) {
+    return;
+  }
+
+  recordVerificationTrace();
+  const finalPosition = Number(elements.verificationSlider.value);
+  if (
+    Math.abs(finalPosition - verificationChallenge.target) >
+    verificationChallenge.tolerance
+  ) {
+    elements.verificationTrack.classList.add("is-error");
+    setVerificationStatus(
+      "还没有与缺口对齐，请继续拖动",
+      "is-error",
+    );
+    return;
+  }
+
+  const session = verificationSession;
+  verificationBusy = true;
+  elements.verificationSlider.disabled = true;
+  elements.verificationTrack.className =
+    "verification-track is-checking";
+  setVerificationStatus("正在由服务端核验轨迹…", "is-checking");
+  syncControls();
+
+  try {
+    const response = await fetch("/api/verification/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        challengeId: verificationChallenge.id,
+        finalPosition,
+        trace: verificationTrace,
+      }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw apiErrorFromPayload(
+        payload,
+        "滑块验证失败。",
+        response.status,
+      );
+    }
+    if (session !== verificationSession || !verificationOpen) return;
+
+    elements.verificationTrack.className =
+      "verification-track is-success";
+    setVerificationStatus("验证通过，正在启动分析…", "is-success");
+    await new Promise((resolve) => window.setTimeout(resolve, 260));
+    if (session !== verificationSession || !verificationOpen) return;
+
+    const analysis = pendingAnalysis;
+    pendingAnalysis = null;
+    closeVerification({
+      keepPending: true,
+      restoreFocus: false,
+    });
+    if (!analysis) {
+      showError(
+        "无法启动分析",
+        "待分析信息已经失效，请重新点击开始分析。",
+      );
+      return;
+    }
+    await createAnalysis(analysis, payload.proof);
+  } catch (error) {
+    if (session !== verificationSession || !verificationOpen) return;
+    if (error?.retryAfterSeconds) {
+      beginCooldown(
+        Date.now() + error.retryAfterSeconds * 1_000,
+      );
+      closeVerification();
+      showError("仍在安全冷却", error.message);
+      return;
+    }
+    await loadVerificationChallenge(
+      session,
+      error?.message || "滑块验证失败。",
+    );
+  }
+}
+
+function closeVerification(options = {}) {
+  const keepPending = options?.keepPending === true;
+  const restoreFocus = options?.restoreFocus !== false;
+  verificationSession += 1;
+  verificationOpen = false;
+  verificationBusy = false;
+  verificationChallenge = null;
+  verificationTrace = [];
+  verificationStartedAt = null;
+  elements.verificationOverlay.hidden = true;
+  elements.verificationSlider.disabled = true;
+  document.body.classList.remove("is-verifying");
+  if (!keepPending) pendingAnalysis = null;
+  syncControls();
+
+  if (
+    restoreFocus &&
+    verificationReturnFocus instanceof HTMLElement
+  ) {
+    verificationReturnFocus.focus();
+  }
+  verificationReturnFocus = null;
+}
+
+function handleVerificationBackdrop(event) {
+  if (event.target === elements.verificationOverlay) {
+    closeVerification();
+  }
+}
+
+function handleVerificationKeydown(event) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeVerification();
+    return;
+  }
+  if (event.key !== "Tab") return;
+
+  const focusable = [
+    elements.verificationClose,
+    elements.verificationSlider,
+    elements.verificationCancel,
+  ].filter((element) => !element.disabled);
+  if (focusable.length === 0) return;
+  const currentIndex = focusable.indexOf(document.activeElement);
+  const nextIndex =
+    currentIndex === -1
+      ? event.shiftKey
+        ? focusable.length - 1
+        : 0
+      : event.shiftKey
+        ? (currentIndex - 1 + focusable.length) % focusable.length
+        : (currentIndex + 1) % focusable.length;
+  event.preventDefault();
+  focusable[nextIndex].focus();
+}
+
+function positionVerificationVisuals() {
+  if (!elements.verificationTrack) return;
+  const width = elements.verificationTrack.clientWidth;
+  if (width <= 0) return;
+
+  const thumbSize = window.matchMedia("(max-width: 620px)").matches
+    ? 48
+    : 44;
+  const sliderPosition =
+    Number(elements.verificationSlider.value || 0) / 1_000;
+  const sliderCenter =
+    thumbSize / 2 + (width - thumbSize) * sliderPosition;
+  elements.verificationFill.style.width = `${sliderCenter}px`;
+
+  if (verificationChallenge) {
+    const targetCenter =
+      thumbSize / 2 +
+      (width - thumbSize) *
+        (verificationChallenge.target / 1_000);
+    elements.verificationTarget.style.left = `${targetCenter}px`;
+  }
+}
+
+function setVerificationStatus(message, stateClass = "") {
+  elements.verificationStatus.textContent = message;
+  elements.verificationStatus.className =
+    `verification-status ${stateClass}`.trim();
+}
+
+function apiErrorFromPayload(payload, fallbackMessage, status) {
+  const error = new Error(payload?.error?.message || fallbackMessage);
+  error.code = payload?.error?.code || "request_failed";
+  error.status = status;
+  error.retryAfterSeconds = Number(
+    payload?.error?.retryAfterSeconds || 0,
+  );
+  return error;
+}
+
+function beginCooldown(value) {
+  const timestamp =
+    typeof value === "number" ? value : Date.parse(String(value));
+  if (!Number.isFinite(timestamp)) return;
+  cooldownUntil = Math.max(cooldownUntil, timestamp);
+  if (cooldownTimer) window.clearInterval(cooldownTimer);
+  cooldownTimer = window.setInterval(updateCooldownUi, 1_000);
+  updateCooldownUi();
+}
+
+function updateCooldownUi() {
+  const remaining = remainingCooldownMs();
+  if (remaining <= 0) {
+    cooldownUntil = 0;
+    if (cooldownTimer) window.clearInterval(cooldownTimer);
+    cooldownTimer = null;
+    elements.protectionCopy.textContent =
+      "启动前需完成滑块验证；同一 IP 或设备每 5 分钟仅可分析一次。";
+  } else {
+    elements.protectionCopy.textContent =
+      `安全冷却中：${formatCooldown(remaining)} 后可再次分析。`;
+  }
+  syncControls();
+}
+
+function remainingCooldownMs() {
+  return Math.max(0, cooldownUntil - Date.now());
+}
+
+function formatCooldown(milliseconds) {
+  const totalSeconds = Math.max(
+    0,
+    Math.ceil(milliseconds / 1_000),
+  );
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
 async function startAnalysis(event) {
   event.preventDefault();
   hideError();
@@ -333,6 +744,23 @@ async function startAnalysis(event) {
     elements.loadModels.focus();
     return;
   }
+  if (remainingCooldownMs() > 0) {
+    showError(
+      "仍在安全冷却",
+      `同一 IP 或设备每 5 分钟只能启动一次分析，请在 ${formatCooldown(remainingCooldownMs())} 后再试。`,
+    );
+    return;
+  }
+
+  pendingAnalysis = { baseUrl, apiKey, model };
+  await openVerification();
+}
+
+async function createAnalysis(
+  { baseUrl, apiKey, model },
+  verificationProof,
+) {
+  hideError();
 
   closeEventStream();
   stopElapsedTimer();
@@ -354,14 +782,24 @@ async function startAnalysis(event) {
     const response = await fetch("/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ baseUrl, apiKey, model }),
+      body: JSON.stringify({
+        baseUrl,
+        apiKey,
+        model,
+        verificationProof,
+      }),
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new Error(payload?.error?.message || "无法创建分析任务。");
+      throw apiErrorFromPayload(
+        payload,
+        "无法创建分析任务。",
+        response.status,
+      );
     }
 
     currentJobId = payload.jobId;
+    beginCooldown(payload.nextAllowedAt);
     elements.apiKey.value = "";
     modelsReady = false;
     modelListSource = null;
@@ -373,6 +811,11 @@ async function startAnalysis(event) {
     startElapsedTimer();
     connectEventStream(payload.events);
   } catch (error) {
+    if (error?.retryAfterSeconds) {
+      beginCooldown(
+        Date.now() + error.retryAfterSeconds * 1_000,
+      );
+    }
     currentSnapshot.status = "failed";
     currentSnapshot.stage = "无法启动分析";
     currentSnapshot.error = {
@@ -866,17 +1309,26 @@ function setBusy(busy) {
 }
 
 function syncControls() {
-  const locked = analysisBusy || modelLoading;
+  const cooldownActive = remainingCooldownMs() > 0;
+  const locked = analysisBusy || modelLoading || verificationOpen;
   elements.baseUrl.disabled = locked;
   elements.apiKey.disabled = locked;
   elements.keyToggle.disabled = locked;
   elements.loadModels.disabled = locked;
   elements.modelSelect.disabled = locked || !modelsReady;
   elements.startButton.disabled =
-    locked || !modelsReady || !elements.modelSelect.value;
-  elements.startButton.firstElementChild.textContent = analysisBusy
-    ? "分析正在进行"
-    : "开始 100 次分析";
+    locked ||
+    cooldownActive ||
+    !modelsReady ||
+    !elements.modelSelect.value;
+  elements.startButton.firstElementChild.textContent =
+    analysisBusy
+      ? "分析正在进行"
+      : verificationOpen
+        ? "等待滑块验证"
+        : cooldownActive
+          ? `安全冷却 ${formatCooldown(remainingCooldownMs())}`
+          : "开始 100 次分析";
   elements.loadModels.textContent = modelLoading
     ? "读取中…"
     : modelsReady

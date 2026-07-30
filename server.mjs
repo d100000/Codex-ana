@@ -2,7 +2,17 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import {
+  createHmac,
+  randomBytes,
+  randomUUID,
+} from "node:crypto";
+import { isIP } from "node:net";
+import {
+  AbuseProtection,
+  AbuseProtectionError,
+  DEFAULT_PROTECTION_CONFIG,
+} from "./src/abuse-protection.mjs";
 import {
   AnalysisError,
   DEFAULT_ANALYSIS_CONFIG,
@@ -16,6 +26,12 @@ const ROOT_DIR = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(ROOT_DIR, "public");
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 4317);
+const TRUST_PROXY = /^(1|true)$/i.test(process.env.TRUST_PROXY ?? "");
+const DEVICE_COOKIE = "planscope_device";
+const DEVICE_COOKIE_MAX_AGE = 365 * 24 * 60 * 60;
+const identitySecret =
+  process.env.ABUSE_SECRET || randomBytes(32);
+const abuseProtection = new AbuseProtection();
 const jobs = new Map();
 const TERMINAL_JOB_TTL_MS = 60 * 60 * 1_000;
 
@@ -43,7 +59,39 @@ const server = createServer(async (request, response) => {
         ok: true,
         service: "codex-plan-scope",
         config: publicConfig(DEFAULT_ANALYSIS_CONFIG),
+        protection: {
+          sliderVerification: true,
+          cooldownSeconds:
+            DEFAULT_PROTECTION_CONFIG.cooldownMs / 1_000,
+          dimensions: ["ip", "device"],
+        },
       });
+      return;
+    }
+
+    if (
+      request.method === "POST" &&
+      pathname === "/api/verification/challenge"
+    ) {
+      const identity = identifyClient(request, response);
+      const challenge = abuseProtection.issueChallenge(identity);
+      sendJson(response, 201, challenge);
+      return;
+    }
+
+    if (
+      request.method === "POST" &&
+      pathname === "/api/verification/verify"
+    ) {
+      const body = await readJsonBody(request);
+      const identity = identifyClient(request, response);
+      const result = abuseProtection.verifyChallenge({
+        challengeId: body?.challengeId,
+        finalPosition: body?.finalPosition,
+        trace: body?.trace,
+        ...identity,
+      });
+      sendJson(response, 200, result);
       return;
     }
 
@@ -63,6 +111,9 @@ const server = createServer(async (request, response) => {
       const baseUrl = String(body?.baseUrl ?? "").trim();
       const apiKey = String(body?.apiKey ?? "").trim();
       const model = String(body?.model ?? "").trim();
+      const verificationProof = String(
+        body?.verificationProof ?? "",
+      ).trim();
       const endpoints = resolveApiEndpoints(baseUrl);
 
       if (!apiKey) {
@@ -76,6 +127,11 @@ const server = createServer(async (request, response) => {
         });
       }
 
+      const identity = identifyClient(request, response);
+      const reservation = abuseProtection.consumeProofAndReserve({
+        proof: verificationProof,
+        ...identity,
+      });
       const id = randomUUID();
       const abortController = new AbortController();
       const job = {
@@ -116,6 +172,9 @@ const server = createServer(async (request, response) => {
         jobId: id,
         location: `/api/jobs/${id}`,
         events: `/api/jobs/${id}/events`,
+        nextAllowedAt: new Date(
+          reservation.nextAllowedAt,
+        ).toISOString(),
       });
       return;
     }
@@ -161,9 +220,21 @@ const server = createServer(async (request, response) => {
       },
     });
   } catch (error) {
-    const status = error instanceof AnalysisError ? 400 : 500;
+    const status =
+      error instanceof AbuseProtectionError
+        ? error.httpStatus
+        : error instanceof AnalysisError
+          ? 400
+          : 500;
     if (status === 500) {
       console.error("Unhandled request error:", error);
+    }
+    const retryAfterSeconds =
+      error instanceof AbuseProtectionError
+        ? error.retryAfterSeconds
+        : null;
+    if (retryAfterSeconds) {
+      response.setHeader("Retry-After", String(retryAfterSeconds));
     }
     sendJson(response, status, {
       error: {
@@ -172,6 +243,7 @@ const server = createServer(async (request, response) => {
           status === 500
             ? "本地服务处理请求时发生错误。"
             : error.message,
+        retryAfterSeconds,
       },
     });
   }
@@ -376,13 +448,98 @@ async function readJsonBody(request) {
   }
 }
 
-function sendJson(response, status, payload) {
+function sendJson(response, status, payload, headers = {}) {
   if (response.headersSent) return;
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
+    ...headers,
   });
   response.end(JSON.stringify(payload));
+}
+
+function identifyClient(request, response) {
+  const cookies = parseCookies(request.headers.cookie);
+  let deviceId = cookies.get(DEVICE_COOKIE);
+  if (!/^[A-Za-z0-9_-]{32}$/.test(deviceId ?? "")) {
+    deviceId = randomBytes(24).toString("base64url");
+    response.setHeader(
+      "Set-Cookie",
+      serializeDeviceCookie(deviceId, request),
+    );
+  }
+
+  return {
+    ipKey: hashIdentity("ip", clientIp(request)),
+    deviceKey: hashIdentity("device", deviceId),
+  };
+}
+
+function clientIp(request) {
+  const forwarded = TRUST_PROXY
+    ? firstHeaderValue(
+        request.headers["cf-connecting-ip"] ??
+          request.headers["x-forwarded-for"] ??
+          request.headers["x-real-ip"],
+      )
+    : null;
+  const remote = String(
+    request.socket?.remoteAddress ?? "unknown",
+  ).trim();
+  return normalizeIp(forwarded) || normalizeIp(remote) || "unknown";
+}
+
+function normalizeIp(value) {
+  let candidate = String(value ?? "").split(",")[0].trim();
+  if (candidate.startsWith("::ffff:")) {
+    candidate = candidate.slice(7);
+  }
+  return isIP(candidate) ? candidate : null;
+}
+
+function firstHeaderValue(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function parseCookies(header) {
+  const cookies = new Map();
+  for (const entry of String(header ?? "").split(";")) {
+    const separator = entry.indexOf("=");
+    if (separator <= 0) continue;
+    const name = entry.slice(0, separator).trim();
+    const value = entry.slice(separator + 1).trim();
+    if (name) cookies.set(name, value);
+  }
+  return cookies;
+}
+
+function serializeDeviceCookie(deviceId, request) {
+  const attributes = [
+    `${DEVICE_COOKIE}=${deviceId}`,
+    "Path=/",
+    `Max-Age=${DEVICE_COOKIE_MAX_AGE}`,
+    "HttpOnly",
+    "SameSite=Strict",
+  ];
+  if (requestIsSecure(request)) attributes.push("Secure");
+  return attributes.join("; ");
+}
+
+function requestIsSecure(request) {
+  if (request.socket?.encrypted) return true;
+  if (!TRUST_PROXY) return false;
+  return (
+    String(request.headers["x-forwarded-proto"] ?? "")
+      .split(",")[0]
+      .trim()
+      .toLowerCase() === "https"
+  );
+}
+
+function hashIdentity(kind, value) {
+  return createHmac("sha256", identitySecret)
+    .update(`${kind}:${value}`)
+    .digest("base64url");
 }
 
 function applySecurityHeaders(response) {
@@ -404,6 +561,7 @@ server.listen(PORT, HOST, () => {
   console.log(
     `固定策略：${DEFAULT_ANALYSIS_CONFIG.totalRequests} 次请求 / ${DEFAULT_ANALYSIS_CONFIG.concurrency} 并发 / 最多 ${DEFAULT_ANALYSIS_CONFIG.maxAttempts} 次尝试`,
   );
+  console.log("防滥用：滑块验证 / IP 与设备独立冷却 5 分钟");
 });
 
 function shutdown() {
