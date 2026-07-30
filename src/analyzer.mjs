@@ -10,6 +10,7 @@ export const DEFAULT_ANALYSIS_CONFIG = Object.freeze({
 });
 
 const MAX_UPSTREAM_BODY_BYTES = 512 * 1_024;
+const MAX_RESPONSES_STREAM_EVENTS = 10_000;
 const MAX_MODEL_COUNT = 500;
 const MAX_MODEL_ID_LENGTH = 200;
 const MAX_API_KEY_LENGTH = 4_096;
@@ -723,7 +724,7 @@ async function runSingleSample({
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
-          Accept: "application/json",
+          Accept: "text/event-stream",
           "OpenAI-Beta": "responses=experimental",
           originator: "codex_cli_rs",
           "User-Agent": "codex-plan-scope/1.0",
@@ -750,10 +751,11 @@ async function runSingleSample({
           },
           max_output_tokens: 16,
           store: false,
-          stream: false,
+          stream: true,
           prompt_cache_key: sampleId,
         }),
         redirect: "manual",
+        streamResponse: true,
         signal: combinedSignal(signal, config.requestTimeoutMs),
       });
     } catch (error) {
@@ -779,8 +781,8 @@ async function runSingleSample({
       return;
     }
 
-    const latencyMs = Math.round(performance.now() - started);
     if (isRedirect(response.status)) {
+      await response.body?.cancel?.().catch(() => {});
       const error = new AnalysisError(
         "接口发生重定向，为避免将 API Key 转发到其他地址已停止该样本。",
         {
@@ -788,21 +790,30 @@ async function runSingleSample({
           status: response.status,
         },
       );
-      completeFailedSample(sample, error, latencyMs);
+      completeFailedSample(
+        sample,
+        error,
+        performance.now() - started,
+      );
       notify();
       return;
     }
 
-    let text;
-    try {
-      text = await readLimitedResponseText(response);
-    } catch (error) {
-      const mapped = mapFetchError(error, "读取响应失败");
-      completeFailedSample(sample, mapped, latencyMs, response.status);
-      notify();
-      return;
-    }
     if (!response.ok) {
+      let text;
+      try {
+        text = await readLimitedResponseText(response);
+      } catch (error) {
+        const mapped = mapFetchError(error, "读取响应失败");
+        completeFailedSample(
+          sample,
+          mapped,
+          performance.now() - started,
+          response.status,
+        );
+        notify();
+        return;
+      }
       const error = new AnalysisError(
         extractErrorMessage(text, [apiKey]),
         {
@@ -828,12 +839,50 @@ async function runSingleSample({
         continue;
       }
 
-      completeFailedSample(sample, error, latencyMs, response.status);
+      completeFailedSample(
+        sample,
+        error,
+        performance.now() - started,
+        response.status,
+      );
       notify();
       return;
     }
 
-    const payload = safeJsonParse(text);
+    let payload;
+    try {
+      ({ payload } = await readResponsesPayload(response, {
+        secrets: [apiKey],
+      }));
+    } catch (error) {
+      const mapped = mapFetchError(error, "读取 Responses 流失败");
+      const canRetry =
+        mapped.retryable && attempt < config.maxAttempts && !signal?.aborted;
+      if (canRetry) {
+        const waitMs = randomDelay(
+          config.retryMinMs,
+          config.retryMaxMs,
+          random,
+        );
+        sample.status = "waiting_retry";
+        sample.httpStatus = response.status;
+        sample.nextRetryMs = waitMs;
+        sample.error = serializeError(mapped);
+        notify();
+        await sleep(waitMs, signal);
+        continue;
+      }
+
+      completeFailedSample(
+        sample,
+        mapped,
+        performance.now() - started,
+        response.status,
+      );
+      notify();
+      return;
+    }
+    const latencyMs = Math.round(performance.now() - started);
     let planResult = extractPlanFromResponse(response.headers, payload);
     if (planResult && containsSecret(planResult.raw, [apiKey])) {
       planResult = null;
@@ -953,6 +1002,289 @@ function mapFetchError(error, prefix) {
     retryable: error?.retryable !== false,
     cause: error,
   });
+}
+
+export async function readResponsesPayload(response, options = {}) {
+  const maxBytes = Number.isFinite(options.maxBytes)
+    ? Math.max(1, Math.floor(options.maxBytes))
+    : MAX_UPSTREAM_BODY_BYTES;
+  const secrets = Array.isArray(options.secrets) ? options.secrets : [];
+  const contentType = String(
+    response?.headers?.get?.("content-type") ?? "",
+  ).toLowerCase();
+
+  if (!contentType.includes("text/event-stream")) {
+    const text = await readLimitedResponseText(response, maxBytes);
+    if (looksLikeResponsesEventStream(text)) {
+      const parser = createResponsesEventStreamParser(secrets);
+      parser.push(text, true);
+      return {
+        ...parser.finish(),
+        transport: "sse_compat",
+      };
+    }
+    return {
+      payload: safeJsonParse(text),
+      transport: "json_compat",
+      terminalEvent: null,
+      eventCount: 0,
+    };
+  }
+
+  const declaredLength = Number(response?.headers?.get?.("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new AnalysisError("上游响应内容超过安全限制。", {
+      code: "upstream_response_too_large",
+    });
+  }
+
+  const reader = response?.body?.getReader?.();
+  if (!reader) {
+    const text = await response.text();
+    if (Buffer.byteLength(text) > maxBytes) {
+      throw new AnalysisError("上游响应内容超过安全限制。", {
+        code: "upstream_response_too_large",
+      });
+    }
+    const parser = createResponsesEventStreamParser(secrets);
+    parser.push(text, true);
+    return parser.finish();
+  }
+
+  const decoder = new TextDecoder();
+  const parser = createResponsesEventStreamParser(secrets);
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new AnalysisError("上游响应内容超过安全限制。", {
+          code: "upstream_response_too_large",
+        });
+      }
+      parser.push(decoder.decode(value, { stream: true }));
+    }
+    parser.push(decoder.decode(), true);
+    return parser.finish();
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock?.();
+  }
+}
+
+function createResponsesEventStreamParser(secrets) {
+  let buffer = "";
+  let eventName = "";
+  let dataLines = [];
+  let eventCount = 0;
+  let terminalEvent = null;
+  let terminalPayload = null;
+  let sawDoneMarker = false;
+  let sawText = false;
+  let finished = false;
+
+  const dispatch = () => {
+    if (dataLines.length === 0) {
+      eventName = "";
+      return;
+    }
+
+    const data = dataLines.join("\n").trim();
+    const declaredEventName = eventName;
+    dataLines = [];
+    eventName = "";
+    if (!data) return;
+    if (data === "[DONE]") {
+      sawDoneMarker = true;
+      return;
+    }
+
+    let event;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      throw new AnalysisError(
+        "Responses 流包含无法解析的 SSE JSON 事件。",
+        {
+          code: "invalid_responses_stream_event",
+          retryable: true,
+        },
+      );
+    }
+
+    eventCount += 1;
+    if (eventCount > MAX_RESPONSES_STREAM_EVENTS) {
+      throw new AnalysisError("Responses 流事件数量超过安全限制。", {
+        code: "responses_stream_event_limit",
+      });
+    }
+
+    const type = cleanStreamEventType(event?.type || declaredEventName);
+    if (type === "error" || type === "response.failed") {
+      throw createResponsesStreamError(event, type, secrets);
+    }
+    if (
+      type === "response.completed" ||
+      type === "response.incomplete"
+    ) {
+      terminalEvent = type;
+      terminalPayload = event?.response ?? event;
+    }
+  };
+
+  const processLine = (line) => {
+    if (line === "") {
+      dispatch();
+      return;
+    }
+    if (line.startsWith(":")) return;
+
+    const separator = line.indexOf(":");
+    const field =
+      separator === -1 ? line : line.slice(0, separator);
+    let value = separator === -1 ? "" : line.slice(separator + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+
+    if (field === "event") {
+      eventName = value;
+    } else if (field === "data") {
+      dataLines.push(value);
+    }
+  };
+
+  const push = (text, flush = false) => {
+    if (finished) {
+      throw new AnalysisError("Responses 流已结束，不能继续写入事件。", {
+        code: "invalid_responses_stream_state",
+      });
+    }
+
+    let chunk = String(text ?? "");
+    if (!sawText) {
+      chunk = chunk.replace(/^\uFEFF/, "");
+      sawText = true;
+    }
+    buffer += chunk;
+
+    while (buffer.length > 0) {
+      const lineFeed = buffer.indexOf("\n");
+      const carriageReturn = buffer.indexOf("\r");
+      let delimiter = -1;
+      if (lineFeed === -1) {
+        delimiter = carriageReturn;
+      } else if (carriageReturn === -1) {
+        delimiter = lineFeed;
+      } else {
+        delimiter = Math.min(lineFeed, carriageReturn);
+      }
+      if (delimiter === -1) break;
+      if (
+        buffer[delimiter] === "\r" &&
+        delimiter === buffer.length - 1 &&
+        !flush
+      ) {
+        break;
+      }
+
+      const line = buffer.slice(0, delimiter);
+      const delimiterLength =
+        buffer[delimiter] === "\r" &&
+        buffer[delimiter + 1] === "\n"
+          ? 2
+          : 1;
+      buffer = buffer.slice(delimiter + delimiterLength);
+      processLine(line);
+    }
+
+    if (flush) {
+      if (buffer) {
+        processLine(buffer);
+        buffer = "";
+      }
+      dispatch();
+    }
+  };
+
+  const finish = () => {
+    if (finished) {
+      throw new AnalysisError("Responses 流被重复结束。", {
+        code: "invalid_responses_stream_state",
+      });
+    }
+    finished = true;
+    if (!terminalEvent) {
+      throw new AnalysisError(
+        sawDoneMarker
+          ? "Responses 流在终止标记前未返回完成事件。"
+          : "Responses 流意外结束，未返回完成事件。",
+        {
+          code: "incomplete_responses_stream",
+          retryable: true,
+        },
+      );
+    }
+    return {
+      payload: terminalPayload,
+      transport: "sse",
+      terminalEvent,
+      eventCount,
+    };
+  };
+
+  return { push, finish };
+}
+
+function looksLikeResponsesEventStream(text) {
+  return /^(?:\uFEFF)?\s*(?::|event:|data:)/.test(String(text ?? ""));
+}
+
+function cleanStreamEventType(value) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .toLowerCase()
+    .slice(0, 128);
+}
+
+function createResponsesStreamError(event, type, secrets) {
+  const response = event?.response;
+  const error = event?.error ?? response?.error;
+  const upstreamCode = String(
+    event?.code ?? error?.code ?? response?.status ?? "",
+  )
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim()
+    .slice(0, 128);
+  const rawMessage = String(
+    event?.message ??
+      error?.message ??
+      response?.incomplete_details?.reason ??
+      "上游返回流式错误",
+  )
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim()
+    .slice(0, 600);
+  const retryText = `${upstreamCode} ${rawMessage}`.toLowerCase();
+  const explicitlyPermanent =
+    /(invalid|auth|permission|forbidden|billing|quota|unsupported)/.test(
+      retryText,
+    );
+
+  return new AnalysisError(
+    redactSecrets(
+      `${type === "response.failed" ? "Responses 生成失败" : "Responses 流返回错误"}${upstreamCode ? `（${upstreamCode}）` : ""}：${rawMessage}`,
+      secrets,
+    ),
+    {
+      code: "responses_stream_error",
+      retryable: !explicitlyPermanent,
+    },
+  );
 }
 
 async function readLimitedResponseText(

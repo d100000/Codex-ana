@@ -335,12 +335,14 @@ async function verifyJobOwnership() {
     });
     assert.equal(analysis.status, 202);
 
-    const ownerRead = await send({
-      port: appPort,
-      path: analysis.json.location,
-      headers: { Cookie: ownerCookie },
-    });
+    const ownerRead = await waitForFirstSample(
+      appPort,
+      analysis.json.location,
+      ownerCookie,
+    );
     assert.equal(ownerRead.status, 200);
+    assert.equal(ownerRead.json.samples[0].status, "classified");
+    assert.equal(ownerRead.json.samples[0].plan.key, "pro");
 
     const foreignRead = await send({
       port: appPort,
@@ -425,6 +427,25 @@ async function waitForHistory(port, cookie) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error("等待分析历史写入超时。");
+}
+
+async function waitForFirstSample(port, path, cookie) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const response = await send({
+      port,
+      path,
+      headers: { Cookie: cookie },
+    });
+    if (
+      ["classified", "unknown", "failed"].includes(
+        response.json?.samples?.[0]?.status,
+      )
+    ) {
+      return response;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("等待首个流式 Responses 样本完成超时。");
 }
 
 function waitForReady(process) {

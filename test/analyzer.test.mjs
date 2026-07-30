@@ -9,6 +9,7 @@ import {
   fastestReasoningEffort,
   listAvailableModels,
   normalizePlan,
+  readResponsesPayload,
   resolveApiEndpoints,
   validateApiKey,
 } from "../src/analyzer.mjs";
@@ -94,6 +95,63 @@ test("body plan_type is used when the response header is absent", () => {
   });
   assert.equal(result.normalized.key, "plus");
   assert.equal(result.source, "response_body:rate_limits.plan_type");
+});
+
+test("Responses SSE is parsed across chunks until response.completed", async () => {
+  const response = chunkedSseResponse([
+    ": keep-alive\r\n\r\n",
+    "event: response.created\r\n",
+    'data: {"type":"response.created","response":{"status":"in_progress"}}\r\n\r\n',
+    "event: response.output_text.delta\r\n",
+    'data: {"type":"response.output_text.delta","delta":"OK"}\r\n\r\n',
+    "event: response.completed\r\n",
+    'data: {"type":"response.completed",\r\n',
+    'data: "response":{"status":"completed","rate_limits":{"plan_type":"education_k12"}}}\r\n\r\n',
+  ]);
+
+  const result = await readResponsesPayload(response);
+  assert.equal(result.transport, "sse");
+  assert.equal(result.terminalEvent, "response.completed");
+  assert.equal(result.eventCount, 3);
+  assert.equal(result.payload.rate_limits.plan_type, "education_k12");
+
+  const plan = extractPlanFromResponse(response.headers, result.payload);
+  assert.equal(plan.normalized.key, "education_k12");
+});
+
+test("Responses SSE error events are redacted and retryable", async () => {
+  const secret = "sk-sensitive-stream-value";
+  const response = chunkedSseResponse([
+    "event: error\n",
+    `data: ${JSON.stringify({
+      type: "error",
+      code: "server_error",
+      message: `temporary failure for ${secret}`,
+    })}\n\n`,
+  ]);
+
+  await assert.rejects(
+    readResponsesPayload(response, { secrets: [secret] }),
+    (error) =>
+      error?.code === "responses_stream_error" &&
+      error.retryable === true &&
+      error.message.includes("[REDACTED]") &&
+      !error.message.includes(secret),
+  );
+});
+
+test("truncated Responses SSE is rejected instead of counted as unknown", async () => {
+  const response = chunkedSseResponse([
+    "event: response.created\n",
+    'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n',
+  ]);
+
+  await assert.rejects(
+    readResponsesPayload(response),
+    (error) =>
+      error?.code === "incomplete_responses_stream" &&
+      error.retryable === true,
+  );
 });
 
 test("untrusted tier values are sanitized and bounded", () => {
@@ -298,6 +356,8 @@ test("analyzer observes concurrency and classifies arbitrary tier values", async
     maxActive = Math.max(maxActive, active);
     const body = JSON.parse(options.body);
     requestBodies.push(body);
+    assert.equal(options.headers.Accept, "text/event-stream");
+    assert.equal(options.streamResponse, true);
     const index = sampleIndex(body.prompt_cache_key);
     await new Promise((resolve) => setTimeout(resolve, 3));
     active -= 1;
@@ -370,7 +430,7 @@ test("analyzer observes concurrency and classifies arbitrary tier values", async
   assert.equal(probe.reasoning.effort, "none");
   assert.equal(probe.max_output_tokens, 16);
   assert.equal(probe.store, false);
-  assert.equal(probe.stream, false);
+  assert.equal(probe.stream, true);
   assert.equal(Object.hasOwn(probe, "instructions"), false);
   assert.equal(Object.hasOwn(probe, "tools"), false);
 });
@@ -479,4 +539,29 @@ function sampleIndex(cacheKey) {
   const match = String(cacheKey).match(/^plan-probe-(\d+)-/);
   assert.ok(match, `unexpected cache key: ${cacheKey}`);
   return Number(match[1]);
+}
+
+function chunkedSseResponse(parts) {
+  const encoder = new TextEncoder();
+  const chunks = parts.flatMap((part) => {
+    const bytes = encoder.encode(part);
+    const middle = Math.max(1, Math.floor(bytes.byteLength / 2));
+    return [
+      bytes.slice(0, middle),
+      bytes.slice(middle),
+    ].filter((chunk) => chunk.byteLength > 0);
+  });
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    }),
+    {
+      headers: {
+        "Content-Type": "text/event-stream; charset=utf-8",
+      },
+    },
+  );
 }

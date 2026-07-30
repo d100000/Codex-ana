@@ -521,18 +521,38 @@ function requestPinned(target, init, policy) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let request;
+    let responseBodyController = null;
+    let responseBodyFinished = false;
     const signal = init?.signal;
 
+    const finishResponseBody = (error = null) => {
+      if (!responseBodyController || responseBodyFinished) return false;
+      responseBodyFinished = true;
+      removeAbortListener();
+      try {
+        if (error) {
+          responseBodyController.error(error);
+        } else {
+          responseBodyController.close();
+        }
+      } catch {
+        // The consumer may already have cancelled the web stream.
+      }
+      return true;
+    };
     const finishReject = (error) => {
-      if (settled) return;
+      if (settled) {
+        finishResponseBody(error);
+        return;
+      }
       settled = true;
       removeAbortListener();
       reject(error);
     };
-    const finishResolve = (value) => {
+    const finishResolve = (value, keepAbortListener = false) => {
       if (settled) return;
       settled = true;
-      removeAbortListener();
+      if (!keepAbortListener) removeAbortListener();
       resolve(value);
     };
     const abortRequest = () => {
@@ -578,6 +598,61 @@ function requestPinned(target, init, policy) {
     signal?.addEventListener("abort", abortRequest, { once: true });
     request.once("error", finishReject);
     request.once("response", (incoming) => {
+      const status = incoming.statusCode ?? 502;
+      const responseHeaders = headersFromIncomingMessage(incoming);
+      const bodyAllowed = ![204, 205, 304].includes(status);
+
+      if (init?.streamResponse === true && bodyAllowed) {
+        let size = 0;
+        const responseStream = new ReadableStream({
+          start(controller) {
+            responseBodyController = controller;
+          },
+          cancel() {
+            if (responseBodyFinished) return;
+            responseBodyFinished = true;
+            removeAbortListener();
+            incoming.destroy();
+            request.destroy();
+          },
+        });
+
+        incoming.on("data", (chunk) => {
+          if (responseBodyFinished) return;
+          const buffer = Buffer.isBuffer(chunk)
+            ? chunk
+            : Buffer.from(chunk);
+          size += buffer.length;
+          if (size > policy.maxResponseBytes) {
+            const error = new UpstreamSecurityError(
+              "上游响应内容超过安全限制。",
+              { code: "upstream_response_too_large" },
+            );
+            finishResponseBody(error);
+            incoming.destroy();
+            request.destroy();
+            return;
+          }
+          try {
+            responseBodyController.enqueue(buffer);
+          } catch (error) {
+            finishResponseBody(error);
+            incoming.destroy();
+            request.destroy();
+          }
+        });
+        incoming.once("error", finishReject);
+        incoming.once("end", () => finishResponseBody());
+        finishResolve(
+          new Response(responseStream, {
+            status,
+            headers: responseHeaders,
+          }),
+          true,
+        );
+        return;
+      }
+
       const chunks = [];
       let size = 0;
 
@@ -601,20 +676,7 @@ function requestPinned(target, init, policy) {
       });
       incoming.once("error", finishReject);
       incoming.once("end", () => {
-        const status = incoming.statusCode ?? 502;
         const bodyBuffer = Buffer.concat(chunks);
-        const responseHeaders = new Headers();
-        for (
-          let index = 0;
-          index < incoming.rawHeaders.length;
-          index += 2
-        ) {
-          responseHeaders.append(
-            incoming.rawHeaders[index],
-            incoming.rawHeaders[index + 1],
-          );
-        }
-        const bodyAllowed = ![204, 205, 304].includes(status);
         finishResolve(
           new Response(bodyAllowed ? bodyBuffer : null, {
             status,
@@ -627,6 +689,21 @@ function requestPinned(target, init, policy) {
     if (body.length > 0) request.write(body);
     request.end();
   });
+}
+
+function headersFromIncomingMessage(incoming) {
+  const headers = new Headers();
+  for (
+    let index = 0;
+    index < incoming.rawHeaders.length;
+    index += 2
+  ) {
+    headers.append(
+      incoming.rawHeaders[index],
+      incoming.rawHeaders[index + 1],
+    );
+  }
+  return headers;
 }
 
 function normalizeRequestBody(value) {

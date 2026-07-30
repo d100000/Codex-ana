@@ -64,17 +64,18 @@ npm start
 7. 聚合所有成功、未识别和失败结果。
 8. 任务结束后，将不含凭据的汇总写入管理历史。
 
-### 极短探测请求
+### 极短流式探测请求
 
-每个样本向非流式 `POST /v1/responses` 发送：
+每个样本统一向 OpenAI Responses API 的 `POST /v1/responses` 发送请求，并以 SSE 流式读取结果：
 
 - 提示词：`Reply exactly OK.`
 - 最大输出：16 tokens
 - `store: false`
-- `stream: false`
+- `stream: true`
+- 请求头 `Accept: text/event-stream`
 - 支持时使用 `reasoning.effort: none`，否则使用兼容的最低开销档位
 
-请求不加载工具，也不要求推理摘要，目的是尽快获得响应头和订阅元数据。
+请求不加载工具，也不要求推理摘要，目的是尽快获得响应头和订阅元数据。服务端会逐块解析 `response.*` SSE 事件，以 `response.completed` 或 `response.incomplete` 作为完整终止事件；流式 `error`、`response.failed`、无终止事件和超限响应均不会被误计为“未识别”。对于未正确设置 SSE `Content-Type`、但仍返回标准事件流的中转站，会使用受限的兼容解析；返回普通 JSON 的兼容中转也可继续读取。
 
 ## 订阅等级如何判定
 

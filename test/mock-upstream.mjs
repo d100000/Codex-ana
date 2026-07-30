@@ -27,6 +27,12 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "POST" && url.pathname === "/v1/responses") {
     const body = await readJson(request);
+    if (body?.stream !== true) {
+      sendJson(response, 400, {
+        error: { message: "Mock requires Responses streaming" },
+      });
+      return;
+    }
     const index = readSampleIndex(body?.prompt_cache_key);
     if (index === null) {
       sendJson(response, 400, {
@@ -61,12 +67,12 @@ const server = createServer(async (request, response) => {
     };
     if (tier) headers["x-codex-plan-type"] = tier;
 
-    sendJson(
+    await sendResponsesStream(
       response,
-      200,
       {
         id: `resp_mock_${index}`,
         object: "response",
+        status: "completed",
         model: body.model,
         output: [],
       },
@@ -113,6 +119,50 @@ function sendJson(response, status, payload, headers = {}) {
     ...headers,
   });
   response.end(JSON.stringify(payload));
+}
+
+async function sendResponsesStream(response, payload, headers = {}) {
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    ...headers,
+  });
+
+  const events = [
+    {
+      type: "response.created",
+      response: {
+        id: payload.id,
+        object: payload.object,
+        status: "in_progress",
+        model: payload.model,
+        output: [],
+      },
+    },
+    {
+      type: "response.output_text.delta",
+      delta: "OK",
+      sequence_number: 1,
+    },
+    {
+      type: "response.output_text.done",
+      text: "OK",
+      sequence_number: 2,
+    },
+    {
+      type: "response.completed",
+      response: payload,
+      sequence_number: 3,
+    },
+  ];
+
+  for (const event of events) {
+    response.write(
+      `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  response.end();
 }
 
 function shutdown() {

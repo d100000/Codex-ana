@@ -233,6 +233,68 @@ test("safe fetch caps untrusted upstream response bodies", async (t) => {
   );
 });
 
+test("safe fetch exposes an opt-in bounded response stream", async () => {
+  const safeFetch = createSafeFetch({
+    allowHttp: true,
+    allowPrivateNetworks: true,
+    allowedPorts: [8_080],
+    maxResponseBytes: 4_096,
+    httpRequest: fakeTransport(() => ({
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+      body: "event: response.completed\ndata: {}\n\n",
+    })),
+    resolver: async () => [
+      { address: "127.0.0.1", family: 4 },
+    ],
+  });
+
+  const response = await safeFetch(
+    "http://stream.example:8080/v1/responses",
+    {
+      redirect: "manual",
+      streamResponse: true,
+    },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/event-stream");
+  assert.equal(
+    await response.text(),
+    "event: response.completed\ndata: {}\n\n",
+  );
+});
+
+test("safe fetch rejects oversized bodies while a stream is consumed", async () => {
+  const safeFetch = createSafeFetch({
+    allowHttp: true,
+    allowPrivateNetworks: true,
+    allowedPorts: [8_080],
+    maxResponseBytes: 1_024,
+    httpRequest: fakeTransport(() => ({
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+      body: "x".repeat(2_048),
+    })),
+    resolver: async () => [
+      { address: "127.0.0.1", family: 4 },
+    ],
+  });
+
+  const response = await safeFetch(
+    "http://stream-limit.example:8080/v1/responses",
+    {
+      redirect: "manual",
+      streamResponse: true,
+    },
+  );
+
+  await assert.rejects(
+    response.text(),
+    (error) => error?.code === "upstream_response_too_large",
+  );
+});
+
 async function publicResolver() {
   return [{ address: "93.184.216.34", family: 4 }];
 }
