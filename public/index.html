@@ -198,24 +198,24 @@
             <p id="success-metric">等待开始采样</p>
           </article>
           <article class="metric-card">
-            <span><i class="legend-dot plan-pro" aria-hidden="true"></i>Pro</span>
-            <strong id="pro-metric">0.0<small>%</small></strong>
-            <p id="pro-count">0 个样本</p>
+            <span>发现订阅等级</span>
+            <strong id="tier-count-metric">0<small>种</small></strong>
+            <p id="tier-count-copy">按返回的 tier 自动去重</p>
           </article>
           <article class="metric-card">
-            <span><i class="legend-dot plan-plus" aria-hidden="true"></i>Plus</span>
-            <strong id="plus-metric">0.0<small>%</small></strong>
-            <p id="plus-count">0 个样本</p>
+            <span><i class="legend-dot plan-classified" aria-hidden="true"></i>已识别</span>
+            <strong id="classified-metric">0.0<small>%</small></strong>
+            <p id="classified-count">0 个样本</p>
           </article>
           <article class="metric-card">
-            <span><i class="legend-dot plan-free" aria-hidden="true"></i>Free</span>
-            <strong id="free-metric">0.0<small>%</small></strong>
-            <p id="free-count">0 个样本</p>
+            <span><i class="legend-dot plan-unknown" aria-hidden="true"></i>未识别</span>
+            <strong id="unknown-metric">0.0<small>%</small></strong>
+            <p id="unknown-count">0 个样本</p>
           </article>
           <article class="metric-card">
-            <span><i class="legend-dot plan-unknown" aria-hidden="true"></i>未识别 / 失败</span>
-            <strong id="unresolved-metric">0.0<small>%</small></strong>
-            <p id="unresolved-count">0 个样本</p>
+            <span><i class="legend-dot plan-failed" aria-hidden="true"></i>失败</span>
+            <strong id="failed-metric">0.0<small>%</small></strong>
+            <p id="failed-count">0 个样本</p>
           </article>
           <article class="metric-card">
             <span>平均响应</span>
@@ -230,13 +230,11 @@
               <p class="eyebrow">SAMPLE FIELD / 02</p>
               <h2>100 次请求光谱</h2>
             </div>
-            <div class="matrix-legend" aria-label="样本状态图例">
-              <span><i class="plan-pro"></i>Pro</span>
-              <span><i class="plan-plus"></i>Plus</span>
-              <span><i class="plan-free"></i>Free</span>
-              <span><i class="plan-unknown"></i>未识别</span>
-              <span><i class="plan-failed"></i>失败</span>
-            </div>
+            <div
+              class="matrix-legend"
+              id="matrix-legend"
+              aria-label="样本状态图例"
+            ></div>
           </div>
           <div
             class="sample-matrix"

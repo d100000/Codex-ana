@@ -1,22 +1,20 @@
 const FIXED_TOTAL = 100;
 
-const PLAN_COLORS = Object.freeze({
-  pro: "#315be8",
-  plus: "#0b9b88",
-  free: "#d99117",
-  go: "#287fa6",
-  prolite: "#7656d6",
-  self_serve_business_prolite: "#6b55b2",
-  team: "#176f91",
-  business: "#274e9c",
-  self_serve_business_usage_based: "#274e9c",
-  enterprise: "#6a3f91",
-  ent26: "#6a3f91",
-  enterprise_cbp_usage_based: "#6a3f91",
-  education: "#aa5f27",
-  edu: "#aa5f27",
-  guest: "#8a96a3",
-});
+const PLAN_COLOR_PALETTE = Object.freeze([
+  "#315be8",
+  "#0b9b88",
+  "#d99117",
+  "#7656d6",
+  "#287fa6",
+  "#b44d78",
+  "#527a38",
+  "#b05d2f",
+  "#4d63a8",
+  "#776c24",
+  "#3c7e72",
+  "#9b4aa0",
+]);
+const planColorRegistry = new Map();
 
 const STATUS_LABELS = Object.freeze({
   queued: "等待",
@@ -60,16 +58,17 @@ const elements = {
   dismissError: document.querySelector("#dismiss-error"),
   completedMetric: document.querySelector("#completed-metric"),
   successMetric: document.querySelector("#success-metric"),
-  proMetric: document.querySelector("#pro-metric"),
-  proCount: document.querySelector("#pro-count"),
-  plusMetric: document.querySelector("#plus-metric"),
-  plusCount: document.querySelector("#plus-count"),
-  freeMetric: document.querySelector("#free-metric"),
-  freeCount: document.querySelector("#free-count"),
-  unresolvedMetric: document.querySelector("#unresolved-metric"),
-  unresolvedCount: document.querySelector("#unresolved-count"),
+  tierCountMetric: document.querySelector("#tier-count-metric"),
+  tierCountCopy: document.querySelector("#tier-count-copy"),
+  classifiedMetric: document.querySelector("#classified-metric"),
+  classifiedCount: document.querySelector("#classified-count"),
+  unknownMetric: document.querySelector("#unknown-metric"),
+  unknownCount: document.querySelector("#unknown-count"),
+  failedMetric: document.querySelector("#failed-metric"),
+  failedCount: document.querySelector("#failed-count"),
   latencyMetric: document.querySelector("#latency-metric"),
   sampleMatrix: document.querySelector("#sample-matrix"),
+  matrixLegend: document.querySelector("#matrix-legend"),
   distributionDonut: document.querySelector("#distribution-donut"),
   donutValue: document.querySelector("#donut-value"),
   distributionLegend: document.querySelector("#distribution-legend"),
@@ -184,6 +183,7 @@ async function startAnalysis(event) {
 
   closeEventStream();
   stopElapsedTimer();
+  planColorRegistry.clear();
   selectedSampleIndex = null;
   currentJobId = null;
   currentSnapshot = {
@@ -302,9 +302,11 @@ async function cancelAnalysis() {
 }
 
 function render(snapshot) {
+  registerPlanColors(snapshot.breakdown?.plans || []);
   renderStatus(snapshot);
   renderMetrics(snapshot.breakdown);
   renderMatrix(snapshot.samples);
+  renderMatrixLegend(snapshot.breakdown);
   renderDistribution(snapshot.breakdown);
   renderRecords();
   renderEvidence();
@@ -361,31 +363,66 @@ function statusDescription(snapshot) {
 }
 
 function renderMetrics(breakdown = {}) {
-  const pro = findPlan(breakdown, "pro");
-  const plus = findPlan(breakdown, "plus");
-  const free = findPlan(breakdown, "free");
-  const unresolved = (breakdown.unknown || 0) + (breakdown.failed || 0);
   const total = breakdown.total || FIXED_TOTAL;
-  const unresolvedPercent = toPercent(unresolved, total);
+  const tierCount = breakdown.plans?.length || 0;
 
   setMetric(elements.completedMetric, breakdown.completed || 0, `/${total}`);
   elements.successMetric.textContent =
     breakdown.completed > 0
       ? `${breakdown.classified || 0} 个已识别 · ${breakdown.failed || 0} 个失败`
       : "等待开始采样";
-  setMetric(elements.proMetric, formatPercent(pro.percent), "%");
-  elements.proCount.textContent = `${pro.count} 个样本`;
-  setMetric(elements.plusMetric, formatPercent(plus.percent), "%");
-  elements.plusCount.textContent = `${plus.count} 个样本`;
-  setMetric(elements.freeMetric, formatPercent(free.percent), "%");
-  elements.freeCount.textContent = `${free.count} 个样本`;
-  setMetric(elements.unresolvedMetric, formatPercent(unresolvedPercent), "%");
-  elements.unresolvedCount.textContent = `${unresolved} 个样本`;
+  setMetric(elements.tierCountMetric, tierCount, "种");
+  elements.tierCountCopy.textContent =
+    tierCount > 0 ? "完全按接口返回值统计" : "按返回的 tier 自动去重";
+  setMetric(
+    elements.classifiedMetric,
+    formatPercent(toPercent(breakdown.classified || 0, total)),
+    "%",
+  );
+  elements.classifiedCount.textContent = `${breakdown.classified || 0} 个样本`;
+  setMetric(
+    elements.unknownMetric,
+    formatPercent(breakdown.unknownPercent),
+    "%",
+  );
+  elements.unknownCount.textContent = `${breakdown.unknown || 0} 个样本`;
+  setMetric(
+    elements.failedMetric,
+    formatPercent(breakdown.failedPercent),
+    "%",
+  );
+  elements.failedCount.textContent = `${breakdown.failed || 0} 个样本`;
   setMetric(
     elements.latencyMetric,
     breakdown.averageLatencyMs ?? "—",
     "ms",
   );
+}
+
+function renderMatrixLegend(breakdown = {}) {
+  const items = (breakdown.plans || []).map((plan) => ({
+    label: plan.label,
+    color: colorForPlan(plan.key),
+  }));
+  if (breakdown.unknown > 0) {
+    items.push({ label: "未识别", color: "#8997a2" });
+  }
+  if (breakdown.failed > 0) {
+    items.push({ label: "失败", color: "#d25748" });
+  }
+  if (items.length === 0) {
+    items.push({ label: "等待样本", color: "#c3cdd3" });
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const item of items) {
+    const wrapper = document.createElement("span");
+    const swatch = document.createElement("i");
+    swatch.style.background = item.color;
+    wrapper.append(swatch, document.createTextNode(item.label));
+    fragment.append(wrapper);
+  }
+  elements.matrixLegend.replaceChildren(fragment);
 }
 
 function setMetric(element, value, suffix) {
@@ -802,25 +839,22 @@ function matchesFilter(sample, filter) {
   return sample.status === filter;
 }
 
-function findPlan(breakdown, key) {
-  return (
-    breakdown?.plans?.find((plan) => plan.key === key) || {
-      key,
-      count: 0,
-      percent: 0,
-    }
-  );
-}
-
 function colorForPlan(key) {
   if (!key) return "#8997a2";
-  if (PLAN_COLORS[key]) return PLAN_COLORS[key];
-  let hash = 0;
-  for (const character of String(key)) {
-    hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  if (!planColorRegistry.has(key)) {
+    const index = planColorRegistry.size;
+    const color =
+      PLAN_COLOR_PALETTE[index] ??
+      `hsl(${Math.round((index * 137.508) % 360)} 58% 40%)`;
+    planColorRegistry.set(key, color);
   }
-  const palette = ["#4464ad", "#477f70", "#956b3d", "#755b9f", "#387b91"];
-  return palette[hash % palette.length];
+  return planColorRegistry.get(key);
+}
+
+function registerPlanColors(plans) {
+  for (const plan of plans) {
+    if (plan?.key) colorForPlan(plan.key);
+  }
 }
 
 function statusColor(sample) {

@@ -747,16 +747,8 @@ code {
   background: var(--unknown);
 }
 
-.plan-pro {
-  background: var(--blue) !important;
-}
-
-.plan-plus {
+.plan-classified {
   background: var(--teal) !important;
-}
-
-.plan-free {
-  background: var(--amber) !important;
 }
 
 .plan-unknown {

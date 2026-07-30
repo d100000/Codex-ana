@@ -9,29 +9,9 @@ export const DEFAULT_ANALYSIS_CONFIG = Object.freeze({
   requestTimeoutMs: 45_000,
 });
 
-const PLAN_LABELS = Object.freeze({
-  guest: "Guest",
-  free: "Free",
-  free_workspace: "Free Workspace",
-  go: "Go",
-  plus: "Plus",
-  pro: "Pro",
-  prolite: "Pro Lite",
-  self_serve_business_prolite: "Business Pro Lite",
-  team: "Team",
-  self_serve_business_usage_based: "Business Usage",
-  business: "Business",
-  ent26: "Enterprise",
-  enterprise_cbp_usage_based: "Enterprise Usage",
-  enterprise: "Enterprise",
-  education: "Education",
-  edu: "Education",
-  quorum: "Quorum",
-  k12: "K-12",
-});
-
 const COMMON_MODEL_FALLBACKS = Object.freeze([
   "gpt-5.4-mini",
+  "gpt-5.3-codex-spark",
   "gpt-5.3-codex",
   "gpt-5-codex",
   "codex-mini-latest",
@@ -97,7 +77,8 @@ export function resolveApiEndpoints(rawUrl) {
 }
 
 export function normalizePlan(rawPlan) {
-  const raw = String(rawPlan ?? "")
+  const source = String(rawPlan ?? "").trim();
+  const raw = source
     .trim()
     .toLowerCase()
     .replaceAll("-", "_")
@@ -109,16 +90,20 @@ export function normalizePlan(rawPlan) {
 
   return {
     key: raw,
-    label: PLAN_LABELS[raw] ?? titleCasePlan(raw),
-    known: Object.hasOwn(PLAN_LABELS, raw),
+    label: formatPlanLabel(source),
   };
 }
 
-function titleCasePlan(value) {
+function formatPlanLabel(value) {
   return value
-    .split("_")
+    .replace(/[-_\s]+/g, " ")
+    .split(" ")
     .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .map((part) =>
+      /\d/.test(part)
+        ? part.toUpperCase()
+        : part.charAt(0).toUpperCase() + part.slice(1).toLowerCase(),
+    )
     .join(" ");
 }
 
@@ -164,8 +149,10 @@ function scoreModel(modelId) {
   const id = modelId.toLowerCase();
   let score = 0;
 
+  if (id.includes("codex-spark")) score += 1_500;
+  if (id.includes("luna")) score += 1_050;
   if (id === "gpt-5.4-mini") score += 1_000;
-  if (id.includes("mini") || id.includes("compact") || id.includes("luna")) {
+  if (id.includes("mini") || id.includes("compact")) {
     score += 350;
   }
   if (id.includes("codex")) score += 240;
@@ -175,6 +162,18 @@ function scoreModel(modelId) {
   if (id.includes("pro")) score -= 80;
 
   return score;
+}
+
+export function fastestReasoningEffort(modelId) {
+  const id = String(modelId ?? "").trim().toLowerCase();
+
+  if (/^gpt-5\.(?:1|2|4|5|6)(?:$|[-.])/.test(id)) {
+    return "none";
+  }
+  if (/^gpt-5(?:$|-2025)/.test(id)) {
+    return "minimal";
+  }
+  return "low";
 }
 
 export function extractPlanFromResponse(headers, payload = null) {
@@ -329,26 +328,8 @@ export function calculateBreakdown(samples, totalRequests) {
     }
   }
 
-  const preferredOrder = [
-    "pro",
-    "plus",
-    "free",
-    "go",
-    "prolite",
-    "team",
-    "business",
-    "enterprise",
-  ];
-
   const plans = [...counts.values()]
-    .sort((a, b) => {
-      const ai = preferredOrder.indexOf(a.key);
-      const bi = preferredOrder.indexOf(b.key);
-      if (ai !== -1 || bi !== -1) {
-        return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
-      }
-      return b.count - a.count || a.label.localeCompare(b.label);
-    })
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
     .map((entry) => ({
       ...entry,
       percent: roundPercent(entry.count, total),
@@ -624,24 +605,19 @@ async function runSingleSample({
         },
         body: JSON.stringify({
           model,
-          instructions: "",
           input: [
             {
               role: "user",
               content: [
                 {
                   type: "input_text",
-                  text: "Reply only: OK",
+                  text: "Reply exactly OK.",
                 },
               ],
             },
           ],
-          tools: [],
-          tool_choice: "auto",
-          parallel_tool_calls: false,
           reasoning: {
-            effort: "low",
-            summary: "auto",
+            effort: fastestReasoningEffort(model),
           },
           max_output_tokens: 16,
           store: false,

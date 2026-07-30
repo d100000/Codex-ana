@@ -1,6 +1,6 @@
 # PlanScope · Codex 订阅光谱
 
-PlanScope 是一个只在本机运行的 Codex 中转池采样工具。用户填写兼容 OpenAI API 的地址和 API Key 后，它会执行 100 个逻辑样本，并统计本次采样中 Pro、Plus、Free 及其他订阅等级的比例。
+PlanScope 是一个只在本机运行的 Codex 中转池采样工具。用户填写兼容 OpenAI API 的地址和 API Key 后，它会执行 100 个逻辑样本，并按照接口实际返回的 tier 动态统计订阅等级比例。
 
 ## 它如何判定订阅
 
@@ -12,6 +12,10 @@ PlanScope 是一个只在本机运行的 Codex 中转池采样工具。用户填
 4. 响应体 `rate_limits.plan_type` / `rateLimits.planType`
 
 同时保留 `x-codex-active-limit`、主/次限额窗口、Credits 状态和上游请求 ID，供逐条核验。正常响应中没有以上订阅字段时，该样本记为“未识别”，不会仅凭模型名称或额度猜测订阅。
+
+订阅等级没有白名单。Pro、Plus、Team、K12 或任何未来新增的非空 tier 都会自动成为独立分类，并使用动态颜色显示。
+
+探测请求只发送一句 `Reply exactly OK.`，不加载工具，不要求推理摘要，输出上限为 16 tokens；支持无推理模式的模型会使用 `reasoning.effort: none`，其他模型回退到其低开销档位。
 
 ## 固定采样策略
 
@@ -54,7 +58,7 @@ npm start
 - 地址：`http://127.0.0.1:4318`
 - Key：`sk-test-local`
 
-模拟上游会返回固定分布：Pro 45%、Plus 30%、Free 15%、Business 5%、未识别 5%，并让 4 个样本先失败一次，用于验证随机重试。
+模拟上游会返回多种动态 tier，并让 4 个样本先失败一次，用于验证未知等级统计与随机重试。
 
 ## 测试
 

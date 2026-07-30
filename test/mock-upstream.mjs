@@ -76,14 +76,18 @@ const server = createServer(async (request, response) => {
 server.listen(PORT, HOST, () => {
   console.log(`PlanScope 模拟上游：http://${HOST}:${PORT}`);
   console.log(`测试 Key：${EXPECTED_KEY}`);
-  console.log("分布：Pro 45 / Plus 30 / Free 15 / Business 5 / Unknown 5");
+  console.log(
+    "动态分布：Pro 30 / Plus 20 / Team 15 / K12 15 / Partner Alpha 10 / Enterprise Custom 5 / Unknown 5",
+  );
 });
 
 function tierForIndex(index) {
-  if (index < 45) return "pro";
-  if (index < 75) return "plus";
-  if (index < 90) return "free";
-  if (index < 95) return "business";
+  if (index < 30) return "pro";
+  if (index < 50) return "plus";
+  if (index < 65) return "team";
+  if (index < 80) return "k12";
+  if (index < 90) return "partner_alpha";
+  if (index < 95) return "enterprise_custom";
   return null;
 }
 

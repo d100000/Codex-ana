@@ -6,6 +6,7 @@ import {
   chooseModel,
   extractCodexEvidence,
   extractPlanFromResponse,
+  fastestReasoningEffort,
   normalizePlan,
   resolveApiEndpoints,
 } from "../src/analyzer.mjs";
@@ -39,16 +40,18 @@ test("resolveApiEndpoints rejects unsafe or malformed URLs", () => {
   );
 });
 
-test("plan normalization preserves unknown tiers and labels known ones", () => {
+test("plan normalization accepts known and previously unseen tier values", () => {
   assert.deepEqual(normalizePlan(" PRO "), {
     key: "pro",
     label: "Pro",
-    known: true,
   });
   assert.deepEqual(normalizePlan("partner-ultra"), {
     key: "partner_ultra",
     label: "Partner Ultra",
-    known: false,
+  });
+  assert.deepEqual(normalizePlan("k12"), {
+    key: "k12",
+    label: "K12",
   });
 });
 
@@ -104,21 +107,31 @@ test("breakdown percentages always use the logical sample total", () => {
   assert.equal(breakdown.averageLatencyMs, 15);
 });
 
-test("model choice prefers a low-cost Codex-compatible model", () => {
+test("model choice prefers an ultra-fast Codex-compatible model", () => {
   const choice = chooseModel([
     "gpt-image-1",
     "gpt-5.4",
     "gpt-5.3-codex",
     "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
   ]);
-  assert.equal(choice.selected, "gpt-5.4-mini");
+  assert.equal(choice.selected, "gpt-5.3-codex-spark");
   assert.equal(choice.source, "models_endpoint");
 });
 
-test("analyzer observes concurrency and classifies every logical sample", async () => {
+test("reasoning effort uses the fastest compatible level", () => {
+  assert.equal(fastestReasoningEffort("gpt-5.4-mini"), "none");
+  assert.equal(fastestReasoningEffort("gpt-5.6-luna"), "none");
+  assert.equal(fastestReasoningEffort("gpt-5"), "minimal");
+  assert.equal(fastestReasoningEffort("gpt-5.3-codex-spark"), "low");
+  assert.equal(fastestReasoningEffort("custom-codex"), "low");
+});
+
+test("analyzer observes concurrency and classifies arbitrary tier values", async () => {
   let active = 0;
   let maxActive = 0;
   let postCount = 0;
+  const requestBodies = [];
   const fetchImpl = async (url, options = {}) => {
     if (String(url).endsWith("/models")) {
       return Response.json({ data: [{ id: "gpt-5.4-mini" }] });
@@ -128,12 +141,23 @@ test("analyzer observes concurrency and classifies every logical sample", async 
     active += 1;
     maxActive = Math.max(maxActive, active);
     const body = JSON.parse(options.body);
+    requestBodies.push(body);
     const index = sampleIndex(body.prompt_cache_key);
     await new Promise((resolve) => setTimeout(resolve, 3));
     active -= 1;
 
     const tier =
-      index < 8 ? "pro" : index < 14 ? "plus" : index < 18 ? "free" : null;
+      index < 6
+        ? "pro"
+        : index < 10
+          ? "plus"
+          : index < 14
+            ? "team"
+            : index < 18
+              ? "k12"
+              : index === 18
+                ? "partner_alpha"
+                : null;
     const headers = new Headers({
       "x-request-id": `req_${index}`,
       "x-codex-primary-used-percent": String(index),
@@ -161,17 +185,35 @@ test("analyzer observes concurrency and classifies every logical sample", async 
   assert.equal(postCount, 20);
   assert.ok(maxActive <= 5, `max active was ${maxActive}`);
   assert.equal(state.breakdown.completed, 20);
-  assert.equal(state.breakdown.classified, 18);
-  assert.equal(state.breakdown.unknown, 2);
-  assert.equal(state.breakdown.plans.find((plan) => plan.key === "pro").count, 8);
+  assert.equal(state.breakdown.classified, 19);
+  assert.equal(state.breakdown.unknown, 1);
+  assert.equal(state.breakdown.plans.length, 5);
+  assert.equal(state.breakdown.plans.find((plan) => plan.key === "pro").count, 6);
   assert.equal(
     state.breakdown.plans.find((plan) => plan.key === "plus").count,
-    6,
-  );
-  assert.equal(
-    state.breakdown.plans.find((plan) => plan.key === "free").count,
     4,
   );
+  assert.equal(
+    state.breakdown.plans.find((plan) => plan.key === "team").count,
+    4,
+  );
+  assert.equal(
+    state.breakdown.plans.find((plan) => plan.key === "k12").label,
+    "K12",
+  );
+  assert.equal(
+    state.breakdown.plans.find((plan) => plan.key === "partner_alpha").count,
+    1,
+  );
+
+  const probe = requestBodies[0];
+  assert.equal(probe.input[0].content[0].text, "Reply exactly OK.");
+  assert.equal(probe.reasoning.effort, "none");
+  assert.equal(probe.max_output_tokens, 16);
+  assert.equal(probe.store, false);
+  assert.equal(probe.stream, false);
+  assert.equal(Object.hasOwn(probe, "instructions"), false);
+  assert.equal(Object.hasOwn(probe, "tools"), false);
 });
 
 test("retryable failures wait 1–3 seconds and reuse one logical sample", async () => {
