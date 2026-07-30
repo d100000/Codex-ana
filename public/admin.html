@@ -43,7 +43,7 @@
           <h1>运行记录</h1>
           <p>
             查看分析任务汇总与最近 24 小时的请求审计日志。
-            两类记录均不包含 API key、请求正文、查询参数或单条响应证据。
+            分析历史只保留汇总；失败请求会额外保留脱敏后的诊断明细。
           </p>
         </div>
         <span class="privacy-badge">
@@ -239,7 +239,7 @@
             id="request-log-filters"
           >
             <label>
-              <span>搜索路由、错误码或请求 ID</span>
+              <span>搜索域名、模型、路由、错误码或请求 ID</span>
               <input
                 id="request-log-query"
                 type="search"
@@ -288,8 +288,8 @@
                   <th scope="col">路由</th>
                   <th scope="col">状态</th>
                   <th scope="col">耗时</th>
-                  <th scope="col">来源摘要</th>
-                  <th scope="col">设备摘要</th>
+                  <th scope="col">来源 / 域名</th>
+                  <th scope="col">设备 / 样本</th>
                   <th scope="col">错误码 / 请求 ID</th>
                 </tr>
               </thead>
@@ -310,9 +310,10 @@
             </button>
           </div>
           <p class="admin-retention-note">
-            仅记录方法、白名单路由、状态码、耗时及不可逆摘要。
-            请求正文、查询参数、Authorization、Cookie 和 API Key
-            均不会进入日志；超过 24 小时的记录由服务端自动删除。
+            普通站内请求仅记录方法、路由、状态码、耗时及不可逆摘要。
+            上游失败会额外保存固定探针的安全请求字段和最多 4 KB 的脱敏返回正文；
+            Authorization、Cookie、API Key 和查询参数不会进入日志。
+            所有请求日志超过 24 小时后由服务端自动删除。
           </p>
         </section>
       </section>
@@ -346,6 +347,47 @@
       <p class="history-dialog-note">
         百分比分母是该次任务计划的逻辑样本总数；此处仅展示汇总，
         不保存任何 API key 或原始响应。
+      </p>
+    </dialog>
+
+    <dialog
+      class="history-dialog request-log-dialog"
+      id="request-log-dialog"
+      aria-labelledby="request-log-dialog-title"
+      aria-describedby="request-log-dialog-subtitle"
+    >
+      <form method="dialog">
+        <button
+          class="history-dialog-close"
+          aria-label="关闭请求明细"
+          value="close"
+        >
+          ×
+        </button>
+      </form>
+      <div class="history-dialog-heading">
+        <p class="eyebrow">UPSTREAM FAILURE / 06</p>
+        <h2 id="request-log-dialog-title">失败请求明细</h2>
+        <p id="request-log-dialog-subtitle"></p>
+      </div>
+      <dl
+        class="history-detail-grid"
+        id="request-log-detail-grid"
+      ></dl>
+      <section class="admin-diagnostic-section">
+        <h3>安全请求正文</h3>
+        <pre id="request-log-request-body">—</pre>
+      </section>
+      <section class="admin-diagnostic-section">
+        <div>
+          <h3>上游返回报错</h3>
+          <span id="request-log-truncated" hidden>已截断至 4 KB</span>
+        </div>
+        <pre id="request-log-response-body">—</pre>
+      </section>
+      <p class="history-dialog-note">
+        此明细只保留 24 小时，并经过服务端字段白名单与敏感值脱敏。
+        不包含 API Key、Authorization 或 Cookie。
       </p>
     </dialog>
   </body>

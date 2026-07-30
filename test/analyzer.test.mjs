@@ -295,6 +295,82 @@ test("upstream errors cannot echo API keys into results", async () => {
   );
 });
 
+test("failed samples retain bounded, redacted upstream diagnostics", async () => {
+  const apiKey = "sk-sensitive-sample-secret";
+  const echoedToken = "sk-another-returned-secret";
+  let latestState;
+
+  await assert.rejects(
+    analyzeSubscriptionPool({
+      baseUrl: "https://gateway.example",
+      apiKey,
+      model: "gpt-5.5",
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/models")) {
+          return Response.json({ data: [{ id: "gpt-5.5" }] });
+        }
+        return Response.json(
+          {
+            error: {
+              code: "unsupported_model",
+              message: "The selected model is not enabled.",
+              api_key: apiKey,
+              authorization: `Bearer ${echoedToken}`,
+            },
+          },
+          {
+            status: 400,
+            headers: {
+              "x-request-id": "req_failure_detail_001",
+              "cf-ray": "test-ray-sha",
+            },
+          },
+        );
+      },
+      onUpdate(state) {
+        latestState = structuredClone(state);
+      },
+      config: {
+        totalRequests: 1,
+        concurrency: 1,
+        maxAttempts: 1,
+        retryMinMs: 1,
+        retryMaxMs: 1,
+        requestTimeoutMs: 5_000,
+      },
+      jobSeed: "01234567-89ab-4def-8123-456789abcdef",
+    }),
+    (error) => error?.code === "preflight_sample_failed",
+  );
+
+  const sample = latestState.samples[0];
+  assert.equal(sample.status, "failed");
+  assert.equal(sample.requestSummary.method, "POST");
+  assert.equal(
+    sample.requestSummary.endpoint,
+    "https://gateway.example/v1/responses",
+  );
+  assert.equal(sample.requestSummary.body.stream, true);
+  assert.equal(sample.requestSummary.body.store, false);
+  assert.equal(sample.failureDetails.length, 1);
+  assert.equal(sample.failureDetails[0].response.status, 400);
+  assert.equal(
+    sample.failureDetails[0].response.requestId,
+    "req_failure_detail_001",
+  );
+  assert.match(
+    sample.failureDetails[0].response.body,
+    /unsupported_model/,
+  );
+  assert.match(
+    sample.failureDetails[0].response.body,
+    /\[REDACTED\]/,
+  );
+  const serialized = JSON.stringify(latestState);
+  assert.doesNotMatch(serialized, new RegExp(apiKey));
+  assert.doesNotMatch(serialized, new RegExp(echoedToken));
+});
+
 test("successful upstream metadata cannot echo API keys into snapshots", async () => {
   const apiKey = "sk-sensitive-success-value";
   const state = await analyzeSubscriptionPool({
@@ -481,6 +557,16 @@ test("retryable failures wait 1–3 seconds and reuse one logical sample", async
   assert.deepEqual([...attempts.values()], [2, 2, 2, 2]);
   assert.equal(waits.length, 4);
   assert.ok(waits.every((wait) => wait >= 1_000 && wait <= 3_000));
+  assert.ok(
+    state.samples.every(
+      (sample) =>
+        sample.failureDetails.length === 1 &&
+        sample.failureDetails[0].response.status === 503 &&
+        sample.failureDetails[0].response.body.includes(
+          "temporary overload",
+        ),
+    ),
+  );
 });
 
 test("analyzer rejects a stale model selection before sampling", async () => {

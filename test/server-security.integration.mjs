@@ -267,6 +267,7 @@ async function verifyJobOwnership() {
     env: {
       ...process.env,
       MOCK_PORT: String(mockPort),
+      MOCK_FAIL_FIRST_SAMPLE_ONCE: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -349,6 +350,19 @@ async function verifyJobOwnership() {
     assert.equal(ownerRead.status, 200);
     assert.equal(ownerRead.json.samples[0].status, "classified");
     assert.equal(ownerRead.json.samples[0].plan.key, "pro");
+    assert.equal(
+      ownerRead.json.samples[0].failureDetails.length,
+      1,
+    );
+    assert.equal(
+      ownerRead.json.samples[0].failureDetails[0].response.status,
+      503,
+    );
+    assert.match(
+      ownerRead.json.samples[0].failureDetails[0].response.body,
+      /\[REDACTED\]/,
+    );
+    assert.doesNotMatch(ownerRead.text, /sk-test-local/);
 
     const foreignRead = await send({
       port: appPort,
@@ -413,6 +427,33 @@ async function verifyJobOwnership() {
     assert.doesNotMatch(history.text, /sk-test-local/);
     assert.doesNotMatch(history.text, /apiKey/);
 
+    const upstreamLogs = await send({
+      port: appPort,
+      path: "/api/admin/request-logs?q=%2Fv1%2Fresponses",
+      headers: { Cookie: `${ownerCookie}; ${adminCookie}` },
+    });
+    assert.equal(upstreamLogs.status, 200);
+    assert.ok(upstreamLogs.json.records.length >= 1);
+    const upstreamFailure = upstreamLogs.json.records.find(
+      (record) =>
+        record.scope === "upstream" &&
+        record.sampleIndex === 1,
+    );
+    assert.ok(upstreamFailure);
+    assert.equal(upstreamFailure.domain, `localhost:${mockPort}`);
+    assert.equal(upstreamFailure.sampleIndex, 1);
+    assert.equal(upstreamFailure.attempt, 1);
+    assert.equal(upstreamFailure.responseDetail.status, 503);
+    assert.match(
+      upstreamFailure.responseDetail.body,
+      /\[REDACTED\]/,
+    );
+    assert.doesNotMatch(upstreamLogs.text, /sk-test-local/);
+    assert.doesNotMatch(
+      upstreamLogs.text,
+      /authorization|cookie|apiKey/i,
+    );
+
     console.log(
       JSON.stringify({
         ownerRead: ownerRead.status,
@@ -422,6 +463,7 @@ async function verifyJobOwnership() {
         terminalStreamClosed: terminalEvents.status,
         historyRecord: history.status,
         historyDomain: history.json.records[0].domain,
+        upstreamFailureLog: upstreamLogs.status,
       }),
     );
   } finally {
@@ -445,7 +487,7 @@ async function waitForHistory(port, cookie) {
 }
 
 async function waitForFirstSample(port, path, cookie) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     const response = await send({
       port,
       path,

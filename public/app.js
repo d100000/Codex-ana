@@ -91,6 +91,7 @@ const elements = {
   evidenceTitle: document.querySelector("#evidence-title"),
   emptyEvidence: document.querySelector("#empty-evidence"),
   evidenceList: document.querySelector("#evidence-list"),
+  failureDetails: document.querySelector("#failure-details"),
   recordFilter: document.querySelector("#record-filter"),
   recordBody: document.querySelector("#record-body"),
   exportJson: document.querySelector("#export-json"),
@@ -945,6 +946,15 @@ async function cancelAnalysis() {
 }
 
 function render(snapshot) {
+  if (
+    selectedSampleIndex === null &&
+    snapshot.status === "failed"
+  ) {
+    selectedSampleIndex =
+      snapshot.samples?.find(
+        (sample) => sample.status === "failed",
+      )?.index ?? null;
+  }
   registerPlanColors(snapshot.breakdown?.plans || []);
   renderStatus(snapshot);
   renderMetrics(snapshot.breakdown);
@@ -1271,6 +1281,8 @@ function renderEvidence() {
   if (!sample) {
     elements.emptyEvidence.hidden = false;
     elements.evidenceList.hidden = true;
+    elements.failureDetails.hidden = true;
+    elements.failureDetails.replaceChildren();
     elements.selectedIndex.textContent = "#—";
     elements.evidenceTitle.textContent = "样本证据";
     return;
@@ -1327,6 +1339,122 @@ function renderEvidence() {
     fragment.append(wrapper);
   }
   elements.evidenceList.replaceChildren(fragment);
+  renderFailureDetails(sample);
+}
+
+function renderFailureDetails(sample) {
+  const failures = Array.isArray(sample.failureDetails)
+    ? sample.failureDetails
+    : [];
+  elements.failureDetails.replaceChildren();
+  elements.failureDetails.hidden = failures.length === 0;
+  if (failures.length === 0) return;
+
+  const heading = document.createElement("div");
+  heading.className = "failure-details-heading";
+  const title = document.createElement("h3");
+  title.textContent = `失败尝试 · ${failures.length}`;
+  const note = document.createElement("p");
+  note.textContent =
+    "以下内容已移除 API Key、Authorization、Cookie 等敏感信息。";
+  heading.append(title, note);
+  elements.failureDetails.append(heading);
+
+  failures.forEach((failure, failureIndex) => {
+    const details = document.createElement("details");
+    details.className = "failure-attempt";
+    details.open = failureIndex === failures.length - 1;
+
+    const summary = document.createElement("summary");
+    const summaryTitle = document.createElement("strong");
+    const status =
+      failure.response?.status ??
+      failure.error?.status ??
+      null;
+    summaryTitle.textContent =
+      `尝试 ${failure.attempt || failureIndex + 1} · ${
+        status ? `HTTP ${status}` : "未收到 HTTP 响应"
+      }`;
+    const summaryMeta = document.createElement("span");
+    summaryMeta.textContent =
+      `${failure.latencyMs ?? 0} ms · ${failure.error?.code || "unknown_error"}`;
+    summary.append(summaryTitle, summaryMeta);
+    details.append(summary);
+
+    const content = document.createElement("div");
+    content.className = "failure-attempt-content";
+    content.append(
+      createFailureMetaGrid(sample.requestSummary, failure),
+      createDiagnosticBlock(
+        "安全请求正文",
+        formatRequestBody(sample.requestSummary?.body),
+      ),
+      createDiagnosticBlock(
+        "上游返回报错",
+        failure.response?.body ||
+          failure.error?.message ||
+          "上游未返回响应正文。",
+        failure.response?.bodyTruncated,
+      ),
+    );
+    details.append(content);
+    elements.failureDetails.append(details);
+  });
+}
+
+function createFailureMetaGrid(request, failure) {
+  const response = failure.response || {};
+  const grid = document.createElement("dl");
+  grid.className = "failure-meta-grid";
+  const items = [
+    ["请求", `${request?.method || "POST"} ${request?.endpoint || "—"}`],
+    ["协议", request?.protocol || "OpenAI Responses"],
+    ["错误", failure.error?.message || "未知错误"],
+    ["Content-Type", response.contentType || "—"],
+    ["上游请求 ID", response.requestId || "—"],
+    ["CF-Ray / Retry-After", `${response.cfRay || "—"} / ${response.retryAfter || "—"}`],
+  ];
+  for (const [label, value] of items) {
+    const wrapper = document.createElement("div");
+    if (label === "请求" || label === "错误") {
+      wrapper.className = "is-wide";
+    }
+    const term = document.createElement("dt");
+    const detail = document.createElement("dd");
+    term.textContent = label;
+    detail.textContent = value;
+    wrapper.append(term, detail);
+    grid.append(wrapper);
+  }
+  return grid;
+}
+
+function createDiagnosticBlock(titleText, bodyText, truncated = false) {
+  const section = document.createElement("section");
+  section.className = "diagnostic-block";
+  const heading = document.createElement("div");
+  const title = document.createElement("h4");
+  title.textContent = titleText;
+  heading.append(title);
+  if (truncated) {
+    const badge = document.createElement("span");
+    badge.textContent = "已截断至 4 KB";
+    heading.append(badge);
+  }
+  const pre = document.createElement("pre");
+  pre.textContent = bodyText || "—";
+  section.append(heading, pre);
+  return section;
+}
+
+function formatRequestBody(body) {
+  if (!body) return "—";
+  if (typeof body === "string") return body;
+  try {
+    return JSON.stringify(body, null, 2);
+  } catch {
+    return "请求正文无法格式化。";
+  }
 }
 
 function selectSample(index, scrollToEvidence) {
@@ -1496,23 +1624,34 @@ function exportCsv() {
     "primary_used_percent",
     "primary_window_minutes",
     "upstream_request_id",
+    "error_code",
     "error",
+    "failure_request_id",
+    "failure_response_body",
+    "failure_response_truncated",
   ];
-  const rows = (currentSnapshot.samples || []).map((sample) => [
-    sample.index + 1,
-    sample.status,
-    sample.plan?.label || "",
-    sample.rawPlan || "",
-    sample.attempts || 0,
-    sample.httpStatus ?? "",
-    sample.latencyMs ?? "",
-    sample.source || "",
-    sample.evidence?.activeLimit || "",
-    sample.evidence?.primary?.usedPercent ?? "",
-    sample.evidence?.primary?.windowMinutes ?? "",
-    sample.evidence?.upstreamRequestId || "",
-    sample.error?.message || "",
-  ]);
+  const rows = (currentSnapshot.samples || []).map((sample) => {
+    const failure = sample.failureDetails?.at?.(-1);
+    return [
+      sample.index + 1,
+      sample.status,
+      sample.plan?.label || "",
+      sample.rawPlan || "",
+      sample.attempts || 0,
+      sample.httpStatus ?? "",
+      sample.latencyMs ?? "",
+      sample.source || "",
+      sample.evidence?.activeLimit || "",
+      sample.evidence?.primary?.usedPercent ?? "",
+      sample.evidence?.primary?.windowMinutes ?? "",
+      sample.evidence?.upstreamRequestId || "",
+      sample.error?.code || failure?.error?.code || "",
+      sample.error?.message || failure?.error?.message || "",
+      failure?.response?.requestId || "",
+      failure?.response?.body || "",
+      failure?.response?.bodyTruncated ? "true" : "false",
+    ];
+  });
   const csv = [headings, ...rows]
     .map((row) => row.map(csvCell).join(","))
     .join("\n");

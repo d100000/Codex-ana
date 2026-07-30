@@ -3,6 +3,8 @@ import { createServer } from "node:http";
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.MOCK_PORT || 4318);
 const EXPECTED_KEY = "sk-test-local";
+const FAIL_FIRST_SAMPLE_ONCE =
+  process.env.MOCK_FAIL_FIRST_SAMPLE_ONCE === "1";
 const attempts = new Map();
 
 const server = createServer(async (request, response) => {
@@ -43,9 +45,17 @@ const server = createServer(async (request, response) => {
 
     const attempt = (attempts.get(index) || 0) + 1;
     attempts.set(index, attempt);
-    if ([22, 45, 68, 91].includes(index) && attempt === 1) {
+    if (
+      ([22, 45, 68, 91].includes(index) ||
+        (FAIL_FIRST_SAMPLE_ONCE && index === 0)) &&
+      attempt === 1
+    ) {
       sendJson(response, 503, {
-        error: { message: "Mock transient overload; retry expected" },
+        error: {
+          message: FAIL_FIRST_SAMPLE_ONCE && index === 0
+            ? `Mock transient overload; key ${EXPECTED_KEY}; retry expected`
+            : "Mock transient overload; retry expected",
+        },
       });
       return;
     }

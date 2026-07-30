@@ -41,7 +41,10 @@ import {
   RequestLogStore,
   REQUEST_LOG_CLEANUP_INTERVAL_MS,
   REQUEST_LOG_RETENTION_MS,
+  sanitizeUpstreamRequestSummary,
+  sanitizeUpstreamResponseDetail,
 } from "./src/request-log.mjs";
+import { sanitizeDiagnosticText } from "./src/redaction.mjs";
 
 const ROOT_DIR = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(ROOT_DIR, "public");
@@ -595,6 +598,14 @@ async function runJob(job, credentials) {
     // Ensure credentials cannot remain reachable after the task finishes.
     credentials.apiKey = "";
     try {
+      await recordUpstreamFailureLogs(job);
+    } catch (error) {
+      console.error("Upstream failure log write failed:", {
+        name: error?.name,
+        code: error?.code,
+      });
+    }
+    try {
       await adminHistory.record(job);
     } catch (error) {
       console.error("Analysis history write failed:", {
@@ -650,9 +661,112 @@ function sanitizeSample(sample) {
     latencyMs: sample.latencyMs ?? null,
     evidence: sample.evidence ?? null,
     error: sample.error ?? null,
+    requestSummary: sanitizeUpstreamRequestSummary(
+      sample.requestSummary,
+    ),
+    failureDetails: (Array.isArray(sample.failureDetails)
+      ? sample.failureDetails
+      : []
+    )
+      .slice(-10)
+      .map(sanitizeFailureDetail),
     startedAt: sample.startedAt ?? null,
     completedAt: sample.completedAt ?? null,
   };
+}
+
+function sanitizeFailureDetail(detail) {
+  const status = Number(detail?.error?.status);
+  return {
+    attempt: safeInteger(detail?.attempt, 1, 10, 1),
+    occurredAt: safePublicDate(detail?.occurredAt),
+    latencyMs: safeInteger(
+      detail?.latencyMs,
+      0,
+      7 * 24 * 60 * 60 * 1_000,
+      0,
+    ),
+    error: {
+      code: safePublicCode(detail?.error?.code),
+      message:
+        sanitizeDiagnosticText(detail?.error?.message, {
+          maxLength: 600,
+        }) || "未知错误",
+      status:
+        Number.isInteger(status) && status >= 100 && status <= 599
+          ? status
+          : null,
+      retryable: detail?.error?.retryable === true,
+    },
+    response: sanitizeUpstreamResponseDetail(detail?.response),
+  };
+}
+
+async function recordUpstreamFailureLogs(job) {
+  const target = safeUpstreamTarget(job.safeTarget);
+  for (const sample of job.state?.samples ?? []) {
+    const publicSample = sanitizeSample(sample);
+    for (const failure of publicSample.failureDetails) {
+      const upstreamStatus =
+        failure.response?.status ?? failure.error.status ?? null;
+      await requestLog.record({
+        scope: "upstream",
+        requestId: randomUUID(),
+        jobId: job.id,
+        occurredAt: failure.occurredAt,
+        method: "POST",
+        path: target.path,
+        statusCode: upstreamStatus ?? 502,
+        upstreamStatus,
+        durationMs: failure.latencyMs,
+        errorCode: failure.error.code,
+        errorMessage: failure.error.message,
+        domain: target.domain,
+        model: job.state?.selectedModel,
+        sampleIndex: Number(sample.index) + 1,
+        attempt: failure.attempt,
+        requestSummary: publicSample.requestSummary,
+        responseDetail: failure.response,
+      });
+    }
+  }
+}
+
+function safeUpstreamTarget(value) {
+  try {
+    const url = new URL(String(value ?? ""));
+    return {
+      domain: url.host,
+      path: `${url.pathname.replace(/\/+$/, "")}/responses`
+        .replace(/\/{2,}/g, "/"),
+    };
+  } catch {
+    return {
+      domain: null,
+      path: "/v1/responses",
+    };
+  }
+}
+
+function safePublicDate(value) {
+  const timestamp = Date.parse(String(value ?? ""));
+  return Number.isFinite(timestamp)
+    ? new Date(timestamp).toISOString()
+    : new Date().toISOString();
+}
+
+function safePublicCode(value) {
+  const code = String(value ?? "");
+  return /^[A-Za-z][A-Za-z0-9_]{0,99}$/.test(code)
+    ? code
+    : "unknown_error";
+}
+
+function safeInteger(value, min, max, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= min && number <= max
+    ? number
+    : fallback;
 }
 
 function publicConfig(config) {
@@ -1223,7 +1337,7 @@ server.listen(PORT, HOST, () => {
     `网络保护：SSRF 防护已启用 / ${upstreamFetch.policy.allowHttp ? "允许显式 HTTP" : "仅 HTTPS"} / 最大并行任务 ${MAX_ACTIVE_JOBS}`,
   );
   console.log(
-    `请求日志：仅保留 24 小时 / 最多 ${MAX_REQUEST_LOG_RECORDS} 条 / 不记录请求体与查询参数`,
+    `请求日志：仅保留 24 小时 / 最多 ${MAX_REQUEST_LOG_RECORDS} 条 / 上游失败仅保存脱敏诊断`,
   );
   if (adminPasswordConfig.generated) {
     console.log(

@@ -9,6 +9,10 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
+import {
+  createDiagnosticExcerpt,
+  sanitizeDiagnosticText,
+} from "./redaction.mjs";
 
 const REQUEST_LOG_SCHEMA_VERSION = 1;
 export const REQUEST_LOG_RETENTION_MS = 24 * 60 * 60 * 1_000;
@@ -167,6 +171,12 @@ export class RequestLogStore {
           record.requestId,
           record.clientHash,
           record.deviceHash,
+          record.scope,
+          record.jobId,
+          record.domain,
+          record.model,
+          record.errorMessage,
+          record.responseDetail?.requestId,
         ].some((value) =>
           String(value ?? "").toLowerCase().includes(query),
         )
@@ -279,7 +289,7 @@ export function buildRequestLogRecord(value, options = {}) {
     599,
     500,
   );
-  return {
+  const record = {
     requestId: safeIdentifier(value?.requestId) || randomUUID(),
     occurredAt: safeIsoDate(value?.occurredAt, now),
     method: safeMethod(value?.method),
@@ -294,6 +304,38 @@ export function buildRequestLogRecord(value, options = {}) {
     clientHash: safeHash(value?.clientHash),
     deviceHash: safeHash(value?.deviceHash),
     errorCode: safeErrorCode(value?.errorCode),
+  };
+  if (value?.scope !== "upstream") return record;
+
+  return {
+    ...record,
+    scope: "upstream",
+    jobId: safeIdentifier(value?.jobId) || null,
+    domain: safeDomain(value?.domain),
+    model: cleanText(value?.model, 200) || null,
+    sampleIndex: clampInteger(
+      value?.sampleIndex,
+      1,
+      1_000,
+      null,
+    ),
+    attempt: clampInteger(value?.attempt, 1, 10, null),
+    upstreamStatus: clampInteger(
+      value?.upstreamStatus,
+      100,
+      599,
+      null,
+    ),
+    requestSummary: sanitizeUpstreamRequestSummary(
+      value?.requestSummary,
+    ),
+    responseDetail: sanitizeUpstreamResponseDetail(
+      value?.responseDetail,
+    ),
+    errorMessage:
+      sanitizeDiagnosticText(value?.errorMessage, {
+        maxLength: 600,
+      }) || null,
   };
 }
 
@@ -318,7 +360,7 @@ function sanitizeStoredRecord(value) {
     0,
   );
   if (!statusCode) return null;
-  return {
+  const record = {
     requestId: safeIdentifier(value.requestId) || randomUUID(),
     occurredAt,
     method: safeMethod(value.method),
@@ -333,6 +375,33 @@ function sanitizeStoredRecord(value) {
     clientHash: safeHash(value.clientHash),
     deviceHash: safeHash(value.deviceHash),
     errorCode: safeErrorCode(value.errorCode),
+  };
+  if (value.scope !== "upstream") return record;
+
+  return {
+    ...record,
+    scope: "upstream",
+    jobId: safeIdentifier(value.jobId) || null,
+    domain: safeDomain(value.domain),
+    model: cleanText(value.model, 200) || null,
+    sampleIndex: clampInteger(value.sampleIndex, 1, 1_000, null),
+    attempt: clampInteger(value.attempt, 1, 10, null),
+    upstreamStatus: clampInteger(
+      value.upstreamStatus,
+      100,
+      599,
+      null,
+    ),
+    requestSummary: sanitizeUpstreamRequestSummary(
+      value.requestSummary,
+    ),
+    responseDetail: sanitizeUpstreamResponseDetail(
+      value.responseDetail,
+    ),
+    errorMessage:
+      sanitizeDiagnosticText(value.errorMessage, {
+        maxLength: 600,
+      }) || null,
   };
 }
 
@@ -407,6 +476,152 @@ function safeErrorCode(value) {
   return /^[A-Za-z][A-Za-z0-9_]{0,99}$/.test(code)
     ? code
     : null;
+}
+
+function safeDomain(value) {
+  const domain = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return (
+    domain.length <= 253 &&
+    /^(?:\[[0-9a-f:.]+\]|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::\d{1,5})?$/i.test(
+      domain,
+    )
+  )
+    ? domain
+    : null;
+}
+
+export function sanitizeUpstreamRequestSummary(value) {
+  if (!value || typeof value !== "object") return null;
+  const endpoint = safeEndpoint(value.endpoint);
+  const body = value.body && typeof value.body === "object"
+    ? {
+        model:
+          sanitizeDiagnosticText(value.body.model, {
+            maxLength: 200,
+          }) || null,
+        input: sanitizeProbeInput(value.body.input),
+        reasoning: {
+          effort:
+            sanitizeDiagnosticText(
+              value.body.reasoning?.effort,
+              {
+                maxLength: 32,
+              },
+            ) || null,
+        },
+        max_output_tokens: clampInteger(
+          value.body.max_output_tokens,
+          1,
+          10_000,
+          null,
+        ),
+        store: value.body.store === true,
+        stream: value.body.stream === true,
+        prompt_cache_key:
+          sanitizeDiagnosticText(value.body.prompt_cache_key, {
+            maxLength: 240,
+          }) || null,
+      }
+    : null;
+
+  return {
+    method: "POST",
+    endpoint,
+    protocol:
+      sanitizeDiagnosticText(value.protocol, {
+        maxLength: 80,
+      }) || "OpenAI Responses",
+    headers: {
+      accept:
+        sanitizeDiagnosticText(value.headers?.accept, {
+          maxLength: 80,
+        }) ||
+        "text/event-stream",
+      contentType:
+        sanitizeDiagnosticText(value.headers?.contentType, {
+          maxLength: 80,
+        }) ||
+        "application/json",
+    },
+    body,
+  };
+}
+
+function sanitizeProbeInput(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 4).map((message) => ({
+    role:
+      sanitizeDiagnosticText(message?.role, {
+        maxLength: 32,
+      }) || null,
+    content: Array.isArray(message?.content)
+      ? message.content.slice(0, 4).map((part) => ({
+          type:
+            sanitizeDiagnosticText(part?.type, {
+              maxLength: 40,
+            }) || null,
+          text:
+            sanitizeDiagnosticText(part?.text, {
+              maxLength: 600,
+            }) || null,
+        }))
+      : [],
+  }));
+}
+
+export function sanitizeUpstreamResponseDetail(value) {
+  if (!value || typeof value !== "object") return null;
+  const body = createDiagnosticExcerpt(value.body, {
+    maxLength: 4_096,
+  });
+  return {
+    status: clampInteger(value.status, 100, 599, null),
+    statusText:
+      sanitizeDiagnosticText(value.statusText, {
+        maxLength: 120,
+      }) || null,
+    contentType:
+      sanitizeDiagnosticText(value.contentType, {
+        maxLength: 160,
+      }) || null,
+    requestId:
+      sanitizeDiagnosticText(value.requestId, {
+        maxLength: 512,
+      }) || null,
+    cfRay:
+      sanitizeDiagnosticText(value.cfRay, {
+        maxLength: 160,
+      }) || null,
+    retryAfter:
+      sanitizeDiagnosticText(value.retryAfter, {
+        maxLength: 120,
+      }) || null,
+    body: body.text || null,
+    bodyTruncated: Boolean(value.bodyTruncated || body.truncated),
+  };
+}
+
+function safeEndpoint(value) {
+  try {
+    const url = new URL(String(value ?? ""));
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      url.username ||
+      url.password
+    ) {
+      return null;
+    }
+    url.search = "";
+    url.hash = "";
+    const endpoint = sanitizeDiagnosticText(url.toString(), {
+      maxLength: 2_048,
+    });
+    return endpoint.length <= 2_048 ? endpoint : null;
+  } catch {
+    return null;
+  }
 }
 
 function cleanText(value, maxLength) {

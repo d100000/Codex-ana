@@ -70,6 +70,27 @@ const elements = {
   requestLogLatency: document.querySelector(
     "#request-log-latency",
   ),
+  requestLogDialog: document.querySelector(
+    "#request-log-dialog",
+  ),
+  requestLogDialogTitle: document.querySelector(
+    "#request-log-dialog-title",
+  ),
+  requestLogDialogSubtitle: document.querySelector(
+    "#request-log-dialog-subtitle",
+  ),
+  requestLogDetailGrid: document.querySelector(
+    "#request-log-detail-grid",
+  ),
+  requestLogRequestBody: document.querySelector(
+    "#request-log-request-body",
+  ),
+  requestLogResponseBody: document.querySelector(
+    "#request-log-response-body",
+  ),
+  requestLogTruncated: document.querySelector(
+    "#request-log-truncated",
+  ),
   dialog: document.querySelector("#history-dialog"),
   dialogTitle: document.querySelector("#history-dialog-title"),
   dialogSubtitle: document.querySelector(
@@ -167,6 +188,14 @@ function wireInteractions() {
   elements.requestLogMore.addEventListener("click", () =>
     loadRequestLogs({ reset: false }),
   );
+  elements.requestLogBody.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-request-log-id]");
+    if (!button) return;
+    const record = requestLogs.find(
+      (entry) => entry.requestId === button.dataset.requestLogId,
+    );
+    if (record) showRequestLogDetails(record);
+  });
   elements.body.addEventListener("click", (event) => {
     const button = event.target.closest("[data-history-id]");
     if (!button) return;
@@ -177,6 +206,11 @@ function wireInteractions() {
   });
   elements.dialog.addEventListener("click", (event) => {
     if (event.target === elements.dialog) elements.dialog.close();
+  });
+  elements.requestLogDialog.addEventListener("click", (event) => {
+    if (event.target === elements.requestLogDialog) {
+      elements.requestLogDialog.close();
+    }
   });
 }
 
@@ -383,6 +417,12 @@ function createRequestLogRow(record) {
 
   const pathCell = document.createElement("td");
   pathCell.className = "admin-log-path";
+  if (record.scope === "upstream") {
+    const scope = document.createElement("span");
+    scope.className = "admin-log-scope";
+    scope.textContent = "上游失败";
+    pathCell.append(scope);
+  }
   const path = document.createElement("code");
   path.textContent = record.path;
   path.title = record.path;
@@ -401,13 +441,22 @@ function createRequestLogRow(record) {
 
   const clientCell = document.createElement("td");
   clientCell.className = "admin-log-hash";
-  clientCell.textContent = record.clientHash ?? "—";
-  clientCell.title = record.clientHash ?? "";
+  clientCell.textContent =
+    record.scope === "upstream"
+      ? record.domain ?? "—"
+      : record.clientHash ?? "—";
+  clientCell.title = clientCell.textContent;
 
   const deviceCell = document.createElement("td");
   deviceCell.className = "admin-log-hash";
-  deviceCell.textContent = record.deviceHash ?? "—";
-  deviceCell.title = record.deviceHash ?? "";
+  deviceCell.textContent =
+    record.scope === "upstream"
+      ? `#${formatSampleIndex(record.sampleIndex)} · 尝试 ${record.attempt ?? "—"}`
+      : record.deviceHash ?? "—";
+  deviceCell.title =
+    record.scope === "upstream"
+      ? record.model ?? deviceCell.textContent
+      : record.deviceHash ?? "";
 
   const metaCell = document.createElement("td");
   metaCell.className = "admin-log-meta";
@@ -418,6 +467,18 @@ function createRequestLogRow(record) {
   requestId.textContent = record.requestId;
   requestId.title = record.requestId;
   metaCell.append(error, requestId);
+  if (record.scope === "upstream") {
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "admin-detail-button admin-log-detail-button";
+    action.dataset.requestLogId = record.requestId;
+    action.textContent = "查看明细";
+    action.setAttribute(
+      "aria-label",
+      `查看样本 ${record.sampleIndex ?? "—"} 第 ${record.attempt ?? "—"} 次尝试的失败明细`,
+    );
+    metaCell.append(action);
+  }
 
   row.append(
     dateCell,
@@ -430,6 +491,65 @@ function createRequestLogRow(record) {
     metaCell,
   );
   return row;
+}
+
+function showRequestLogDetails(record) {
+  const response = record.responseDetail || {};
+  const request = record.requestSummary || {};
+  const upstreamStatus =
+    record.upstreamStatus ?? response.status ?? null;
+  elements.requestLogDialogTitle.textContent =
+    record.domain || "上游失败请求";
+  elements.requestLogDialogSubtitle.textContent =
+    `${formatFullDate(record.occurredAt)} · 样本 #${formatSampleIndex(record.sampleIndex)} · 尝试 ${record.attempt ?? "—"}`;
+  elements.requestLogDetailGrid.replaceChildren();
+
+  const details = [
+    ["模型", record.model ?? "—"],
+    ["HTTP 状态", upstreamStatus ?? "未收到响应"],
+    ["耗时", formatDuration(record.durationMs)],
+    ["错误代码", record.errorCode ?? "—"],
+    ["错误信息", record.errorMessage ?? "—"],
+    ["上游请求 ID", response.requestId ?? "—"],
+    ["Content-Type", response.contentType ?? "—"],
+    ["CF-Ray", response.cfRay ?? "—"],
+    ["Retry-After", response.retryAfter ?? "—"],
+    ["请求地址", request.endpoint ?? `${record.domain ?? ""}${record.path}`],
+  ];
+  for (const [label, value] of details) {
+    const wrapper = document.createElement("div");
+    const term = document.createElement("dt");
+    const description = document.createElement("dd");
+    term.textContent = label;
+    description.textContent = String(value);
+    description.title = String(value);
+    wrapper.append(term, description);
+    elements.requestLogDetailGrid.append(wrapper);
+  }
+
+  elements.requestLogRequestBody.textContent =
+    formatRequestSummaryBody(request.body);
+  elements.requestLogResponseBody.textContent =
+    response.body || record.errorMessage || "上游未返回响应正文。";
+  elements.requestLogTruncated.hidden = !response.bodyTruncated;
+  elements.requestLogDialog.showModal();
+}
+
+function formatRequestSummaryBody(body) {
+  if (!body) return "—";
+  if (typeof body === "string") return body;
+  try {
+    return JSON.stringify(body, null, 2);
+  } catch {
+    return "请求正文无法格式化。";
+  }
+}
+
+function formatSampleIndex(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 1
+    ? String(number).padStart(3, "0")
+    : "—";
 }
 
 function renderHistory(stats) {

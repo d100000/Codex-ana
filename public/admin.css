@@ -481,6 +481,18 @@
   white-space: nowrap;
 }
 
+.admin-log-scope {
+  display: inline-flex;
+  margin-bottom: 4px;
+  padding: 2px 5px;
+  color: #a54236;
+  border: 1px solid rgba(210, 87, 72, 0.22);
+  border-radius: 4px;
+  background: rgba(210, 87, 72, 0.07);
+  font-size: 7px;
+  font-weight: 700;
+}
+
 .admin-log-duration,
 .admin-log-hash {
   color: var(--ink-soft);
@@ -514,6 +526,13 @@
   color: var(--ink-faint);
   font-family: var(--font-mono);
   font-size: 7.5px;
+}
+
+.admin-log-detail-button {
+  display: block;
+  margin-top: 5px;
+  padding: 0;
+  font-size: 8px;
 }
 
 .admin-status {
@@ -760,6 +779,68 @@
   line-height: 1.6;
 }
 
+.request-log-dialog {
+  width: min(820px, calc(100% - 28px));
+}
+
+.request-log-dialog .history-detail-grid > div:last-child {
+  grid-column: span 3;
+}
+
+.request-log-dialog .history-detail-grid dd {
+  overflow-wrap: anywhere;
+}
+
+.admin-diagnostic-section {
+  margin-top: 15px;
+}
+
+.admin-diagnostic-section > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.admin-diagnostic-section h3 {
+  margin: 0 0 7px;
+  font-size: 11px;
+}
+
+.admin-diagnostic-section > div h3 {
+  margin-bottom: 7px;
+}
+
+.admin-diagnostic-section > div span {
+  color: #8c5a08;
+  font-family: var(--font-mono);
+  font-size: 8px;
+}
+
+.admin-diagnostic-section > div span[hidden] {
+  display: none;
+}
+
+.admin-diagnostic-section pre {
+  max-height: 300px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  color: #253946;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #f6f8f9;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+#request-log-request-body {
+  max-height: 160px;
+}
+
 @keyframes admin-spin {
   to {
     transform: rotate(360deg);
@@ -813,6 +894,10 @@
   .history-detail-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .request-log-dialog .history-detail-grid > div:last-child {
+    grid-column: span 2;
+  }
 }
 
 @media (max-width: 460px) {
@@ -839,6 +924,10 @@
 
   .history-detail-grid {
     grid-template-columns: 1fr;
+  }
+
+  .request-log-dialog .history-detail-grid > div:last-child {
+    grid-column: auto;
   }
 
   .history-distribution-row {

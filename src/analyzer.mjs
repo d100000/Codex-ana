@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import {
+  createDiagnosticExcerpt,
+  redactSensitiveText,
+  sanitizeDiagnosticText,
+} from "./redaction.mjs";
 
 export const DEFAULT_ANALYSIS_CONFIG = Object.freeze({
   totalRequests: 100,
@@ -14,6 +19,8 @@ const MAX_RESPONSES_STREAM_EVENTS = 10_000;
 const MAX_MODEL_COUNT = 500;
 const MAX_MODEL_ID_LENGTH = 200;
 const MAX_API_KEY_LENGTH = 4_096;
+const MAX_FAILURE_RESPONSE_CHARS = 4_096;
+const MAX_FAILURE_DETAILS = 10;
 
 const COMMON_MODEL_FALLBACKS = Object.freeze([
   "gpt-5.5",
@@ -32,6 +39,10 @@ export class AnalysisError extends Error {
     this.code = options.code ?? "analysis_error";
     this.status = options.status ?? null;
     this.retryable = options.retryable ?? false;
+    this.diagnosticBody =
+      typeof options.diagnosticBody === "string"
+        ? options.diagnosticBody
+        : null;
   }
 }
 
@@ -707,6 +718,39 @@ async function runSingleSample({
   const sample = state.samples[sampleIndex];
   const sampleId = `plan-probe-${sampleIndex}-${jobSeed}`;
   const sessionId = stableUuid(jobSeed, sampleIndex);
+  const reasoningEffort = fastestReasoningEffort(model);
+  const requestBody = {
+    model,
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "Reply exactly OK.",
+          },
+        ],
+      },
+    ],
+    reasoning: {
+      effort: reasoningEffort,
+    },
+    max_output_tokens: 16,
+    store: false,
+    stream: true,
+    prompt_cache_key: sampleId,
+  };
+  sample.requestSummary = {
+    method: "POST",
+    endpoint: responsesUrl,
+    protocol: "OpenAI Responses",
+    headers: {
+      accept: "text/event-stream",
+      contentType: "application/json",
+    },
+    body: requestBody,
+  };
+  sample.failureDetails ??= [];
 
   for (let attempt = 1; attempt <= config.maxAttempts; attempt += 1) {
     throwIfCancelled(signal);
@@ -717,6 +761,7 @@ async function runSingleSample({
     notify();
 
     const started = performance.now();
+    const attemptStartedAt = new Date().toISOString();
     let response;
     try {
       response = await fetchImpl(responsesUrl, {
@@ -733,33 +778,22 @@ async function runSingleSample({
           "x-client-request-id": sessionId,
           "x-codex-window-id": sessionId,
         },
-        body: JSON.stringify({
-          model,
-          input: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "input_text",
-                  text: "Reply exactly OK.",
-                },
-              ],
-            },
-          ],
-          reasoning: {
-            effort: fastestReasoningEffort(model),
-          },
-          max_output_tokens: 16,
-          store: false,
-          stream: true,
-          prompt_cache_key: sampleId,
-        }),
+        body: JSON.stringify(requestBody),
         redirect: "manual",
         streamResponse: true,
         signal: combinedSignal(signal, config.requestTimeoutMs),
       });
     } catch (error) {
       const mapped = mapFetchError(error, "请求失败");
+      if (!signal?.aborted) {
+        appendFailureDetail(sample, {
+          attempt,
+          attemptStartedAt,
+          latencyMs: performance.now() - started,
+          error: mapped,
+          secrets: [apiKey],
+        });
+      }
       const canRetry =
         mapped.retryable && attempt < config.maxAttempts && !signal?.aborted;
       if (canRetry) {
@@ -790,6 +824,14 @@ async function runSingleSample({
           status: response.status,
         },
       );
+      appendFailureDetail(sample, {
+        attempt,
+        attemptStartedAt,
+        latencyMs: performance.now() - started,
+        response,
+        error,
+        secrets: [apiKey],
+      });
       completeFailedSample(
         sample,
         error,
@@ -805,6 +847,14 @@ async function runSingleSample({
         text = await readLimitedResponseText(response);
       } catch (error) {
         const mapped = mapFetchError(error, "读取响应失败");
+        appendFailureDetail(sample, {
+          attempt,
+          attemptStartedAt,
+          latencyMs: performance.now() - started,
+          response,
+          error: mapped,
+          secrets: [apiKey],
+        });
         completeFailedSample(
           sample,
           mapped,
@@ -822,6 +872,15 @@ async function runSingleSample({
           retryable: isRetryableStatus(response.status),
         },
       );
+      appendFailureDetail(sample, {
+        attempt,
+        attemptStartedAt,
+        latencyMs: performance.now() - started,
+        response,
+        responseBody: text,
+        error,
+        secrets: [apiKey],
+      });
       const canRetry =
         error.retryable && attempt < config.maxAttempts && !signal?.aborted;
       if (canRetry) {
@@ -856,6 +915,17 @@ async function runSingleSample({
       }));
     } catch (error) {
       const mapped = mapFetchError(error, "读取 Responses 流失败");
+      if (!signal?.aborted) {
+        appendFailureDetail(sample, {
+          attempt,
+          attemptStartedAt,
+          latencyMs: performance.now() - started,
+          response,
+          responseBody: mapped.diagnosticBody,
+          error: mapped,
+          secrets: [apiKey],
+        });
+      }
       const canRetry =
         mapped.retryable && attempt < config.maxAttempts && !signal?.aborted;
       if (canRetry) {
@@ -907,6 +977,86 @@ async function runSingleSample({
     notify();
     return;
   }
+}
+
+function appendFailureDetail(
+  sample,
+  {
+    attempt,
+    attemptStartedAt,
+    latencyMs,
+    response = null,
+    responseBody = null,
+    error,
+    secrets = [],
+  },
+) {
+  const body = createDiagnosticExcerpt(responseBody, {
+    secrets,
+    maxLength: MAX_FAILURE_RESPONSE_CHARS,
+  });
+  const headers = response?.headers;
+  const responseDetail = response
+    ? {
+        status: Number(response.status) || null,
+        statusText:
+          sanitizeDiagnosticText(response.statusText, {
+            secrets,
+            maxLength: 120,
+          }) || null,
+        contentType:
+          safeResponseHeader(headers, ["content-type"], secrets) || null,
+        requestId:
+          safeResponseHeader(
+            headers,
+            [
+              "x-request-id",
+              "openai-request-id",
+              "x-oneapi-request-id",
+              "request-id",
+            ],
+            secrets,
+          ) || null,
+        cfRay:
+          safeResponseHeader(headers, ["cf-ray"], secrets) || null,
+        retryAfter:
+          safeResponseHeader(headers, ["retry-after"], secrets) || null,
+        body: body.text || null,
+        bodyTruncated: body.truncated,
+      }
+    : null;
+
+  const failure = {
+    attempt: Math.max(1, Math.trunc(Number(attempt) || 1)),
+    occurredAt: attemptStartedAt,
+    latencyMs: Math.max(0, Math.round(Number(latencyMs) || 0)),
+    error: {
+      ...serializeError(error),
+      message: sanitizeDiagnosticText(error?.message, {
+        secrets,
+        maxLength: 600,
+      }) || "未知错误",
+    },
+    response: responseDetail,
+  };
+  sample.failureDetails = [
+    ...(Array.isArray(sample.failureDetails)
+      ? sample.failureDetails
+      : []),
+    failure,
+  ].slice(-MAX_FAILURE_DETAILS);
+}
+
+function safeResponseHeader(headers, names, secrets) {
+  for (const name of names) {
+    const value = headers?.get?.(name);
+    const clean = sanitizeDiagnosticText(value, {
+      secrets,
+      maxLength: 512,
+    });
+    if (clean) return clean;
+  }
+  return "";
 }
 
 function completeFailedSample(sample, error, latencyMs, status = null) {
@@ -1108,11 +1258,16 @@ function createResponsesEventStreamParser(secrets) {
     try {
       event = JSON.parse(data);
     } catch {
+      const diagnostic = createDiagnosticExcerpt(data, {
+        secrets,
+        maxLength: MAX_FAILURE_RESPONSE_CHARS,
+      });
       throw new AnalysisError(
         "Responses 流包含无法解析的 SSE JSON 事件。",
         {
           code: "invalid_responses_stream_event",
           retryable: true,
+          diagnosticBody: diagnostic.text,
         },
       );
     }
@@ -1283,6 +1438,13 @@ function createResponsesStreamError(event, type, secrets) {
     {
       code: "responses_stream_error",
       retryable: !explicitlyPermanent,
+      diagnosticBody: createDiagnosticExcerpt(
+        JSON.stringify(event),
+        {
+          secrets,
+          maxLength: MAX_FAILURE_RESPONSE_CHARS,
+        },
+      ).text,
     },
   );
 }
@@ -1374,19 +1536,7 @@ function redactStructuredSecrets(value, secrets) {
 }
 
 function redactSecrets(value, secrets) {
-  let result = String(value ?? "");
-  for (const secret of secrets) {
-    const candidate = String(secret ?? "");
-    if (candidate.length >= 4) {
-      for (const variant of new Set([
-        candidate,
-        encodeURIComponent(candidate),
-      ])) {
-        result = result.replaceAll(variant, "[REDACTED]");
-      }
-    }
-  }
-  return result;
+  return redactSensitiveText(value, secrets);
 }
 
 function containsSecret(value, secrets) {
