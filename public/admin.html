@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="PlanScope 分析历史管理后台，仅保存域名和订阅分布汇总。"
+      content="PlanScope 管理后台，查看分析汇总与仅保留 24 小时的隐私化请求日志。"
     />
     <title>管理后台 · PlanScope</title>
     <link rel="stylesheet" href="/styles.css" />
@@ -29,7 +29,7 @@
         <span class="local-dot" aria-hidden="true"></span>
         <span>隐私汇总记录</span>
         <span class="topbar-rule" aria-hidden="true"></span>
-        <span>不保存 API KEY</span>
+        <span>请求日志仅保留 24H</span>
         <a class="topbar-link" href="/">
           返回分析 <span aria-hidden="true">←</span>
         </a>
@@ -40,15 +40,15 @@
       <header class="admin-page-heading">
         <div>
           <p class="eyebrow">ADMIN CONSOLE / 01</p>
-          <h1>分析历史</h1>
+          <h1>运行记录</h1>
           <p>
-            按分析任务查看接口域名、运行结果和动态订阅等级占比。
-            历史文件不包含 API key、完整接口路径、查询参数或单条响应证据。
+            查看分析任务汇总与最近 24 小时的请求审计日志。
+            两类记录均不包含 API key、请求正文、查询参数或单条响应证据。
           </p>
         </div>
         <span class="privacy-badge">
           <span aria-hidden="true">◆</span>
-          最小化记录
+          隐私化记录
         </span>
       </header>
 
@@ -194,6 +194,127 @@
             </button>
           </div>
         </section>
+
+        <section
+          class="admin-history admin-request-log panel"
+          aria-labelledby="request-log-title"
+        >
+          <div class="admin-history-heading">
+            <div>
+              <p class="eyebrow">REQUEST AUDIT / 04</p>
+              <h2 id="request-log-title">请求日志</h2>
+              <p id="request-log-count">正在读取最近 24 小时的请求…</p>
+            </div>
+            <div class="admin-session-actions">
+              <span class="admin-retention-badge">24H 自动删除</span>
+              <button id="request-log-refresh" type="button">刷新日志</button>
+            </div>
+          </div>
+
+          <div class="admin-log-summary" aria-label="请求日志统计">
+            <span>
+              <strong id="request-log-total">0</strong>
+              总请求
+            </span>
+            <span>
+              <strong id="request-log-success">0</strong>
+              成功
+            </span>
+            <span>
+              <strong id="request-log-client-error">0</strong>
+              4xx
+            </span>
+            <span>
+              <strong id="request-log-server-error">0</strong>
+              5xx
+            </span>
+            <span>
+              <strong id="request-log-latency">—</strong>
+              平均耗时
+            </span>
+          </div>
+
+          <form
+            class="admin-filters admin-log-filters"
+            id="request-log-filters"
+          >
+            <label>
+              <span>搜索路由、错误码或请求 ID</span>
+              <input
+                id="request-log-query"
+                type="search"
+                placeholder="例如 /api/models"
+                autocomplete="off"
+              />
+            </label>
+            <label>
+              <span>请求方法</span>
+              <select id="request-log-method">
+                <option value="">全部方法</option>
+                <option value="GET">GET</option>
+                <option value="POST">POST</option>
+                <option value="HEAD">HEAD</option>
+                <option value="OPTIONS">OPTIONS</option>
+              </select>
+            </label>
+            <label>
+              <span>响应状态</span>
+              <select id="request-log-status">
+                <option value="">全部状态</option>
+                <option value="2xx">2xx 成功</option>
+                <option value="3xx">3xx 重定向</option>
+                <option value="4xx">4xx 客户端错误</option>
+                <option value="5xx">5xx 服务端错误</option>
+              </select>
+            </label>
+          </form>
+
+          <div
+            class="admin-notice"
+            id="request-log-error"
+            role="alert"
+            hidden
+          >
+            <strong>日志读取失败</strong>
+            <span id="request-log-error-copy"></span>
+          </div>
+
+          <div class="admin-table-wrap admin-log-table-wrap">
+            <table class="admin-table request-log-table">
+              <thead>
+                <tr>
+                  <th scope="col">请求时间</th>
+                  <th scope="col">方法</th>
+                  <th scope="col">路由</th>
+                  <th scope="col">状态</th>
+                  <th scope="col">耗时</th>
+                  <th scope="col">来源摘要</th>
+                  <th scope="col">设备摘要</th>
+                  <th scope="col">错误码 / 请求 ID</th>
+                </tr>
+              </thead>
+              <tbody id="request-log-body">
+                <tr>
+                  <td colspan="8" class="admin-table-state">
+                    正在读取请求日志…
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="admin-pagination">
+            <span id="request-log-loaded">已加载 0 条</span>
+            <button id="request-log-more" type="button" hidden>
+              加载更多
+            </button>
+          </div>
+          <p class="admin-retention-note">
+            仅记录方法、白名单路由、状态码、耗时及不可逆摘要。
+            请求正文、查询参数、Authorization、Cookie 和 API Key
+            均不会进入日志；超过 24 小时的记录由服务端自动删除。
+          </p>
+        </section>
       </section>
     </main>
 
@@ -213,7 +334,7 @@
         </button>
       </form>
       <div class="history-dialog-heading">
-        <p class="eyebrow">RUN DETAIL / 04</p>
+        <p class="eyebrow">RUN DETAIL / 05</p>
         <h2 id="history-dialog-title">分析详情</h2>
         <p id="history-dialog-subtitle"></p>
       </div>

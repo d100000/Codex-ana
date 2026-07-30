@@ -40,6 +40,36 @@ const elements = {
     "#metric-completed-copy",
   ),
   metricRecent: document.querySelector("#metric-recent"),
+  requestLogRefresh: document.querySelector(
+    "#request-log-refresh",
+  ),
+  requestLogFilters: document.querySelector(
+    "#request-log-filters",
+  ),
+  requestLogQuery: document.querySelector("#request-log-query"),
+  requestLogMethod: document.querySelector("#request-log-method"),
+  requestLogStatus: document.querySelector("#request-log-status"),
+  requestLogCount: document.querySelector("#request-log-count"),
+  requestLogBody: document.querySelector("#request-log-body"),
+  requestLogMore: document.querySelector("#request-log-more"),
+  requestLogLoaded: document.querySelector("#request-log-loaded"),
+  requestLogError: document.querySelector("#request-log-error"),
+  requestLogErrorCopy: document.querySelector(
+    "#request-log-error-copy",
+  ),
+  requestLogTotal: document.querySelector("#request-log-total"),
+  requestLogSuccess: document.querySelector(
+    "#request-log-success",
+  ),
+  requestLogClientError: document.querySelector(
+    "#request-log-client-error",
+  ),
+  requestLogServerError: document.querySelector(
+    "#request-log-server-error",
+  ),
+  requestLogLatency: document.querySelector(
+    "#request-log-latency",
+  ),
   dialog: document.querySelector("#history-dialog"),
   dialogTitle: document.querySelector("#history-dialog-title"),
   dialogSubtitle: document.querySelector(
@@ -54,6 +84,10 @@ let nextOffset = null;
 let total = 0;
 let busy = false;
 let searchTimer = null;
+let requestLogs = [];
+let requestLogNextOffset = null;
+let requestLogTotal = 0;
+let requestLogSearchTimer = null;
 
 initialize();
 
@@ -72,6 +106,7 @@ async function initialize() {
     }
     showDashboard();
     await loadHistory({ reset: true });
+    await loadRequestLogs({ reset: true });
   } catch (error) {
     elements.loading.hidden = true;
     showLogin();
@@ -87,6 +122,9 @@ function wireInteractions() {
   );
   elements.refresh.addEventListener("click", () =>
     loadHistory({ reset: true }),
+  );
+  elements.requestLogRefresh.addEventListener("click", () =>
+    loadRequestLogs({ reset: true }),
   );
   elements.logout.addEventListener("click", logout);
   elements.filters.addEventListener("submit", (event) => {
@@ -105,6 +143,29 @@ function wireInteractions() {
   );
   elements.more.addEventListener("click", () =>
     loadHistory({ reset: false }),
+  );
+  elements.requestLogFilters.addEventListener(
+    "submit",
+    (event) => {
+      event.preventDefault();
+      loadRequestLogs({ reset: true });
+    },
+  );
+  elements.requestLogQuery.addEventListener("input", () => {
+    clearTimeout(requestLogSearchTimer);
+    requestLogSearchTimer = setTimeout(
+      () => loadRequestLogs({ reset: true }),
+      260,
+    );
+  });
+  elements.requestLogMethod.addEventListener("change", () =>
+    loadRequestLogs({ reset: true }),
+  );
+  elements.requestLogStatus.addEventListener("change", () =>
+    loadRequestLogs({ reset: true }),
+  );
+  elements.requestLogMore.addEventListener("click", () =>
+    loadRequestLogs({ reset: false }),
   );
   elements.body.addEventListener("click", (event) => {
     const button = event.target.closest("[data-history-id]");
@@ -141,6 +202,7 @@ async function login(event) {
     showDashboard();
     setBusy(false);
     await loadHistory({ reset: true });
+    await loadRequestLogs({ reset: true });
   } catch (error) {
     setLoginMessage(error.message);
     elements.password.focus();
@@ -160,6 +222,7 @@ async function logout() {
     // network response is interrupted.
   } finally {
     records = [];
+    requestLogs = [];
     elements.dialog.close();
     showLogin();
     setBusy(false);
@@ -206,6 +269,167 @@ async function loadHistory({ reset }) {
   } finally {
     setBusy(false);
   }
+}
+
+async function loadRequestLogs({ reset }) {
+  if (busy) return;
+  setBusy(true);
+  hideRequestLogError();
+  if (reset) {
+    requestLogs = [];
+    requestLogNextOffset = 0;
+    renderRequestLogLoadingRow();
+  }
+
+  const params = new URLSearchParams({
+    limit: "50",
+    offset: String(requestLogNextOffset ?? 0),
+  });
+  const query = elements.requestLogQuery.value.trim();
+  const method = elements.requestLogMethod.value;
+  const status = elements.requestLogStatus.value;
+  if (query) params.set("q", query);
+  if (method) params.set("method", method);
+  if (status) params.set("status", status);
+
+  try {
+    const result = await apiRequest(
+      `/api/admin/request-logs?${params.toString()}`,
+    );
+    requestLogs = reset
+      ? result.records
+      : [...requestLogs, ...result.records];
+    requestLogNextOffset = result.nextOffset;
+    requestLogTotal = result.total;
+    renderRequestLogs(result.stats, result.retentionSeconds);
+  } catch (error) {
+    if (error.status === 401) {
+      showLogin();
+      setLoginMessage("管理会话已过期，请重新登录。");
+      return;
+    }
+    showRequestLogError(error.message);
+    if (requestLogs.length === 0) renderRequestLogErrorRow();
+  } finally {
+    setBusy(false);
+  }
+}
+
+function renderRequestLogs(stats = {}, retentionSeconds = 86_400) {
+  elements.requestLogBody.replaceChildren();
+
+  if (requestLogs.length === 0) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 8;
+    cell.className = "admin-table-state";
+    cell.textContent =
+      elements.requestLogQuery.value ||
+      elements.requestLogMethod.value ||
+      elements.requestLogStatus.value
+        ? "没有符合当前筛选条件的请求日志。"
+        : "最近 24 小时还没有请求日志。";
+    row.append(cell);
+    elements.requestLogBody.append(row);
+  } else {
+    const fragment = document.createDocumentFragment();
+    for (const record of requestLogs) {
+      fragment.append(createRequestLogRow(record));
+    }
+    elements.requestLogBody.append(fragment);
+  }
+
+  const retentionHours = Math.round(retentionSeconds / 3_600);
+  elements.requestLogCount.textContent =
+    `共 ${requestLogTotal} 条匹配记录；仅保留最近 ${retentionHours} 小时`;
+  elements.requestLogLoaded.textContent =
+    `已加载 ${requestLogs.length} / ${requestLogTotal} 条`;
+  elements.requestLogMore.hidden = requestLogNextOffset === null;
+  elements.requestLogTotal.textContent = String(stats.total ?? 0);
+  elements.requestLogSuccess.textContent = String(
+    stats.success ?? 0,
+  );
+  elements.requestLogClientError.textContent = String(
+    stats.clientError ?? 0,
+  );
+  elements.requestLogServerError.textContent = String(
+    stats.serverError ?? 0,
+  );
+  elements.requestLogLatency.textContent = Number.isFinite(
+    stats.averageDurationMs,
+  )
+    ? formatDuration(stats.averageDurationMs)
+    : "—";
+}
+
+function createRequestLogRow(record) {
+  const row = document.createElement("tr");
+
+  const dateCell = document.createElement("td");
+  dateCell.className = "admin-date";
+  const dateMain = document.createElement("strong");
+  const dateSub = document.createElement("span");
+  const date = formatDateParts(record.occurredAt);
+  dateMain.textContent = date.date;
+  dateSub.textContent = date.time;
+  dateCell.append(dateMain, dateSub);
+
+  const methodCell = document.createElement("td");
+  const method = document.createElement("span");
+  method.className =
+    `admin-method is-${String(record.method).toLowerCase()}`;
+  method.textContent = record.method;
+  methodCell.append(method);
+
+  const pathCell = document.createElement("td");
+  pathCell.className = "admin-log-path";
+  const path = document.createElement("code");
+  path.textContent = record.path;
+  path.title = record.path;
+  pathCell.append(path);
+
+  const statusCell = document.createElement("td");
+  const status = document.createElement("span");
+  status.className =
+    `admin-http-status is-${Math.trunc(record.statusCode / 100)}xx`;
+  status.textContent = String(record.statusCode);
+  statusCell.append(status);
+
+  const durationCell = document.createElement("td");
+  durationCell.className = "admin-log-duration";
+  durationCell.textContent = formatDuration(record.durationMs);
+
+  const clientCell = document.createElement("td");
+  clientCell.className = "admin-log-hash";
+  clientCell.textContent = record.clientHash ?? "—";
+  clientCell.title = record.clientHash ?? "";
+
+  const deviceCell = document.createElement("td");
+  deviceCell.className = "admin-log-hash";
+  deviceCell.textContent = record.deviceHash ?? "—";
+  deviceCell.title = record.deviceHash ?? "";
+
+  const metaCell = document.createElement("td");
+  metaCell.className = "admin-log-meta";
+  const error = document.createElement("strong");
+  const requestId = document.createElement("span");
+  error.textContent = record.errorCode ?? "—";
+  error.title = record.errorCode ?? "";
+  requestId.textContent = record.requestId;
+  requestId.title = record.requestId;
+  metaCell.append(error, requestId);
+
+  row.append(
+    dateCell,
+    methodCell,
+    pathCell,
+    statusCell,
+    durationCell,
+    clientCell,
+    deviceCell,
+    metaCell,
+  );
+  return row;
 }
 
 function renderHistory(stats) {
@@ -477,8 +701,10 @@ function setBusy(value) {
   elements.loginButton.disabled =
     value || elements.password.disabled;
   elements.refresh.disabled = value;
+  elements.requestLogRefresh.disabled = value;
   elements.logout.disabled = value;
   elements.more.disabled = value;
+  elements.requestLogMore.disabled = value;
 }
 
 function setLoginMessage(message) {
@@ -493,6 +719,16 @@ function showError(message) {
 function hideError() {
   elements.error.hidden = true;
   elements.errorCopy.textContent = "";
+}
+
+function showRequestLogError(message) {
+  elements.requestLogError.hidden = false;
+  elements.requestLogErrorCopy.textContent = message;
+}
+
+function hideRequestLogError() {
+  elements.requestLogError.hidden = true;
+  elements.requestLogErrorCopy.textContent = "";
 }
 
 function renderLoadingRow() {
@@ -513,6 +749,26 @@ function renderErrorRow() {
   cell.textContent = "暂时无法读取记录，请稍后刷新。";
   row.append(cell);
   elements.body.replaceChildren(row);
+}
+
+function renderRequestLogLoadingRow() {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 8;
+  cell.className = "admin-table-state";
+  cell.textContent = "正在读取请求日志…";
+  row.append(cell);
+  elements.requestLogBody.replaceChildren(row);
+}
+
+function renderRequestLogErrorRow() {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 8;
+  cell.className = "admin-table-state";
+  cell.textContent = "暂时无法读取请求日志，请稍后刷新。";
+  row.append(cell);
+  elements.requestLogBody.replaceChildren(row);
 }
 
 async function apiRequest(path, options = {}) {

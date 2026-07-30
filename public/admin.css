@@ -226,6 +226,10 @@
   padding: 21px;
 }
 
+.admin-request-log {
+  margin-top: 15px;
+}
+
 .admin-history-heading {
   display: flex;
   align-items: center;
@@ -273,6 +277,51 @@
   opacity: 0.55;
 }
 
+.admin-retention-badge {
+  display: inline-flex;
+  min-height: 33px;
+  align-items: center;
+  padding: 0 10px;
+  color: #087765;
+  border: 1px solid rgba(11, 155, 136, 0.24);
+  border-radius: 999px;
+  background: rgba(11, 155, 136, 0.07);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.admin-log-summary {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin-top: 17px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--line);
+  gap: 1px;
+}
+
+.admin-log-summary > span {
+  min-width: 0;
+  padding: 11px 12px;
+  color: var(--ink-faint);
+  background: #fff;
+  font-size: 8.5px;
+}
+
+.admin-log-summary strong {
+  display: block;
+  margin-bottom: 4px;
+  overflow: hidden;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .admin-filters {
   display: grid;
   grid-template-columns: minmax(220px, 1fr) 180px;
@@ -282,6 +331,10 @@
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #f6f8f9;
+}
+
+.admin-log-filters {
+  grid-template-columns: minmax(220px, 1fr) 150px 180px;
 }
 
 .admin-filters label > span {
@@ -330,6 +383,10 @@
   min-width: 960px;
 }
 
+.request-log-table {
+  min-width: 1020px;
+}
+
 .admin-table td {
   max-width: 260px;
   vertical-align: middle;
@@ -359,6 +416,104 @@
   font-family: var(--font-mono);
   font-size: 8px;
   text-overflow: ellipsis;
+}
+
+.admin-method,
+.admin-http-status {
+  display: inline-flex;
+  min-width: 43px;
+  min-height: 23px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #f7f9fa;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.admin-method.is-get {
+  color: #087765;
+  border-color: rgba(11, 155, 136, 0.22);
+  background: rgba(11, 155, 136, 0.07);
+}
+
+.admin-method.is-post {
+  color: var(--blue);
+  border-color: rgba(49, 91, 232, 0.22);
+  background: rgba(49, 91, 232, 0.07);
+}
+
+.admin-http-status.is-2xx {
+  color: #087765;
+  border-color: rgba(11, 155, 136, 0.22);
+  background: rgba(11, 155, 136, 0.07);
+}
+
+.admin-http-status.is-3xx {
+  color: var(--blue);
+  border-color: rgba(49, 91, 232, 0.22);
+  background: rgba(49, 91, 232, 0.07);
+}
+
+.admin-http-status.is-4xx {
+  color: #8c5a08;
+  border-color: rgba(204, 126, 9, 0.24);
+  background: rgba(204, 126, 9, 0.07);
+}
+
+.admin-http-status.is-5xx {
+  color: #a54236;
+  border-color: rgba(210, 87, 72, 0.24);
+  background: rgba(210, 87, 72, 0.07);
+}
+
+.admin-log-path code {
+  display: block;
+  max-width: 230px;
+  overflow: hidden;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-log-duration,
+.admin-log-hash {
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  white-space: nowrap;
+}
+
+.admin-log-hash {
+  max-width: 125px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.admin-log-meta strong,
+.admin-log-meta span {
+  display: block;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-log-meta strong {
+  color: var(--ink-soft);
+  font-size: 8.5px;
+}
+
+.admin-log-meta span {
+  margin-top: 3px;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 7.5px;
 }
 
 .admin-status {
@@ -448,6 +603,15 @@
   padding-top: 11px;
   color: var(--ink-faint);
   font-size: 9px;
+}
+
+.admin-retention-note {
+  margin: 4px 0 0;
+  padding-top: 12px;
+  color: var(--ink-faint);
+  border-top: 1px solid var(--line);
+  font-size: 8.5px;
+  line-height: 1.65;
 }
 
 .history-dialog {
@@ -642,6 +806,10 @@
     grid-template-columns: 1fr;
   }
 
+  .admin-log-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .history-detail-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -658,6 +826,15 @@
 
   .admin-session-actions button {
     flex: 1;
+  }
+
+  .admin-request-log .admin-session-actions {
+    display: flex;
+    align-items: center;
+  }
+
+  .admin-log-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .history-detail-grid {

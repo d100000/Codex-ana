@@ -37,6 +37,11 @@ import {
   securityResponseHeaders,
 } from "./src/http-security.mjs";
 import { createSafeFetch } from "./src/safe-fetch.mjs";
+import {
+  RequestLogStore,
+  REQUEST_LOG_CLEANUP_INTERVAL_MS,
+  REQUEST_LOG_RETENTION_MS,
+} from "./src/request-log.mjs";
 
 const ROOT_DIR = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(ROOT_DIR, "public");
@@ -87,6 +92,12 @@ const MAX_HISTORY_RECORDS = readIntegerEnv(
   100,
   20_000,
 );
+const MAX_REQUEST_LOG_RECORDS = readIntegerEnv(
+  "MAX_REQUEST_LOG_RECORDS",
+  20_000,
+  100,
+  100_000,
+);
 const DATA_DIR = resolve(
   ROOT_DIR,
   process.env.PLANSCOPE_DATA_DIR || ".data",
@@ -101,6 +112,20 @@ const adminHistory = await new AdminHistoryStore({
   filePath: join(DATA_DIR, "analysis-history.json"),
   maxRecords: MAX_HISTORY_RECORDS,
 }).init();
+const requestLog = await new RequestLogStore({
+  filePath: join(DATA_DIR, "request-log.ndjson"),
+  maxRecords: MAX_REQUEST_LOG_RECORDS,
+  retentionMs: REQUEST_LOG_RETENTION_MS,
+}).init();
+const requestLogCleanupTimer = setInterval(() => {
+  void requestLog.purgeExpired().catch((error) => {
+    console.error("Request log cleanup failed:", {
+      name: error?.name,
+      code: error?.code,
+    });
+  });
+}, REQUEST_LOG_CLEANUP_INTERVAL_MS);
+requestLogCleanupTimer.unref();
 const abuseProtection = new AbuseProtection();
 const requestSecurity = createRequestSecurity({
   bindHost: HOST,
@@ -137,6 +162,18 @@ const staticRoutes = new Map([
   ["/admin.css", "admin.css"],
   ["/admin.js", "admin.js"],
 ]);
+const REQUEST_LOG_EXACT_ROUTES = new Set([
+  "/api/health",
+  "/api/admin/session",
+  "/api/admin/login",
+  "/api/admin/logout",
+  "/api/admin/history",
+  "/api/admin/request-logs",
+  "/api/verification/challenge",
+  "/api/verification/verify",
+  "/api/models",
+  "/api/analyze",
+]);
 
 class ServiceError extends Error {
   constructor(message, options = {}) {
@@ -149,6 +186,7 @@ class ServiceError extends Error {
 }
 
 const server = createServer(async (request, response) => {
+  const requestAudit = beginRequestLog(request, response);
   applySecurityHeaders(request, response);
 
   try {
@@ -183,6 +221,14 @@ const server = createServer(async (request, response) => {
           adminHistory: {
             enabled: adminAuth.enabled,
             maxRecords: MAX_HISTORY_RECORDS,
+          },
+          requestLog: {
+            enabled: adminAuth.enabled,
+            retentionSeconds:
+              REQUEST_LOG_RETENTION_MS / 1_000,
+            cleanupIntervalSeconds:
+              REQUEST_LOG_CLEANUP_INTERVAL_MS / 1_000,
+            maxRecords: MAX_REQUEST_LOG_RECORDS,
           },
         },
       });
@@ -259,6 +305,22 @@ const server = createServer(async (request, response) => {
         limit: url.searchParams.get("limit"),
         query: url.searchParams.get("q"),
         status: url.searchParams.get("status"),
+      });
+      sendJson(response, 200, result);
+      return;
+    }
+
+    if (
+      request.method === "GET" &&
+      pathname === "/api/admin/request-logs"
+    ) {
+      requireAdminSession(request, response);
+      const result = requestLog.list({
+        offset: url.searchParams.get("offset"),
+        limit: url.searchParams.get("limit"),
+        query: url.searchParams.get("q"),
+        statusGroup: url.searchParams.get("status"),
+        method: url.searchParams.get("method"),
       });
       sendJson(response, 200, result);
       return;
@@ -460,6 +522,8 @@ const server = createServer(async (request, response) => {
       },
     });
   } catch (error) {
+    requestAudit.errorCode =
+      String(error?.code ?? "internal_error").slice(0, 100);
     const status =
       Number.isInteger(error?.httpStatus)
         ? error.httpStatus
@@ -809,6 +873,88 @@ function sendJson(response, status, payload, headers = {}) {
   response.end(JSON.stringify(payload));
 }
 
+function beginRequestLog(request, response) {
+  const context = { errorCode: null };
+  const requestId = randomUUID();
+  const occurredAt = new Date().toISOString();
+  const startedAt = Date.now();
+  let recorded = false;
+
+  response.setHeader("X-Request-Id", requestId);
+
+  const finalize = (aborted) => {
+    if (recorded) return;
+    recorded = true;
+    const deviceId = parseCookies(request.headers.cookie).get(
+      DEVICE_COOKIE,
+    );
+    void requestLog
+      .record({
+        requestId,
+        occurredAt,
+        method: request.method,
+        path: requestLogRoute(request.url),
+        statusCode: aborted ? 499 : response.statusCode,
+        durationMs: Date.now() - startedAt,
+        clientHash: hashIdentity(
+          "request-log-ip",
+          clientIp(request),
+        ).slice(0, 16),
+        deviceHash: /^[A-Za-z0-9_-]{32}$/.test(deviceId ?? "")
+          ? hashIdentity(
+              "request-log-device",
+              deviceId,
+            ).slice(0, 16)
+          : null,
+        errorCode:
+          context.errorCode ??
+          (aborted ? "client_closed_request" : null),
+      })
+      .catch((error) => {
+        console.error("Request log write failed:", {
+          name: error?.name,
+          code: error?.code,
+        });
+      });
+  };
+
+  response.once("finish", () => finalize(false));
+  response.once("close", () => {
+    if (!response.writableFinished) finalize(true);
+  });
+  return context;
+}
+
+function requestLogRoute(value) {
+  let pathname;
+  try {
+    const source = String(value ?? "");
+    if (
+      !source.startsWith("/") ||
+      source.startsWith("//") ||
+      source.length > 4_096
+    ) {
+      return "/[unmatched]";
+    }
+    pathname = new URL(source, "http://localhost").pathname;
+  } catch {
+    return "/[unmatched]";
+  }
+
+  if (staticRoutes.has(pathname)) return pathname;
+  if (REQUEST_LOG_EXACT_ROUTES.has(pathname)) {
+    return pathname;
+  }
+
+  const jobRoute = pathname.match(
+    /^\/api\/jobs\/[a-f0-9-]+(\/events|\/cancel)?$/i,
+  );
+  if (jobRoute) {
+    return `/api/jobs/:jobId${jobRoute[1] ?? ""}`;
+  }
+  return "/[unmatched]";
+}
+
 function identifyClient(request, response) {
   const cookies = parseCookies(request.headers.cookie);
   let deviceId = cookies.get(DEVICE_COOKIE);
@@ -1067,6 +1213,9 @@ server.listen(PORT, HOST, () => {
   console.log(
     `网络保护：SSRF 防护已启用 / ${upstreamFetch.policy.allowHttp ? "允许显式 HTTP" : "仅 HTTPS"} / 最大并行任务 ${MAX_ACTIVE_JOBS}`,
   );
+  console.log(
+    `请求日志：仅保留 24 小时 / 最多 ${MAX_REQUEST_LOG_RECORDS} 条 / 不记录请求体与查询参数`,
+  );
   if (adminPasswordConfig.generated) {
     console.log(
       `本次启动管理密码：${adminPasswordConfig.password}`,
@@ -1079,10 +1228,19 @@ server.listen(PORT, HOST, () => {
 });
 
 function shutdown() {
+  clearInterval(requestLogCleanupTimer);
   for (const job of jobs.values()) {
     job.abortController.abort();
   }
-  server.close(() => process.exit(0));
+  server.close(async () => {
+    await requestLog.flush().catch((error) => {
+      console.error("Request log flush failed:", {
+        name: error?.name,
+        code: error?.code,
+      });
+    });
+    process.exit(0);
+  });
 }
 
 process.on("SIGINT", shutdown);

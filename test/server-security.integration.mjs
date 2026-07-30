@@ -42,6 +42,10 @@ try {
     /object-src 'none'/,
   );
   assert.equal(health.json.protection.adminHistory.enabled, true);
+  assert.equal(
+    health.json.protection.requestLog.retentionSeconds,
+    86_400,
+  );
 
   const rebinding = await send({
     headers: { Host: `attacker.example:${PORT}` },
@@ -134,6 +138,11 @@ try {
     unauthenticatedHistory.json.error.code,
     "admin_authentication_required",
   );
+  const unauthenticatedRequestLogs = await send({
+    path: "/api/admin/request-logs",
+    headers: { Cookie: adminDeviceCookie },
+  });
+  assert.equal(unauthenticatedRequestLogs.status, 401);
 
   const adminLogin = await send({
     method: "POST",
@@ -156,6 +165,29 @@ try {
   assert.equal(emptyHistory.status, 200);
   assert.deepEqual(emptyHistory.json.records, []);
 
+  const logSecret = "sk-request-log-integration-secret";
+  const loggedHealth = await send({
+    path: `/api/health?api_key=${logSecret}`,
+    headers: { Cookie: authenticatedCookies },
+  });
+  assert.equal(loggedHealth.status, 200);
+  const requestLogs = await send({
+    path: "/api/admin/request-logs?q=%2Fapi%2Fhealth",
+    headers: { Cookie: authenticatedCookies },
+  });
+  assert.equal(requestLogs.status, 200);
+  assert.ok(requestLogs.json.records.length >= 1);
+  assert.ok(
+    requestLogs.json.records.every(
+      (record) => record.path === "/api/health",
+    ),
+  );
+  assert.doesNotMatch(requestLogs.text, new RegExp(logSecret));
+  assert.doesNotMatch(
+    requestLogs.text,
+    /authorization|cookie|apiKey|query/i,
+  );
+
   const foreignAdminDevice = await send({
     path: "/api/admin/history",
     headers: { Cookie: adminCookie },
@@ -174,6 +206,7 @@ try {
       privateTargetCode: privateTarget.json.error.code,
       adminLogin: adminLogin.status,
       adminHistory: emptyHistory.status,
+      requestLogs: requestLogs.status,
       foreignAdminDevice: foreignAdminDevice.status,
     }),
   );
