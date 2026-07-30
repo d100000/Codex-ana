@@ -1,0 +1,17 @@
+{
+  "name": "codex-plan-scope",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "本地 Codex 上游订阅分布分析看板",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs",
+    "mock": "node test/mock-upstream.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check server.mjs && node --check src/analyzer.mjs && node --check public/app.js && node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

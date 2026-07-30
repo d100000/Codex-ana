@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="在本地采样 Codex 兼容中转接口，分析上游订阅等级分布。"
+    />
+    <title>PlanScope · Codex 订阅光谱</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到分析看板</a>
+
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="PlanScope 首页">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+        <span>
+          <strong>PlanScope</strong>
+          <small>Codex 订阅光谱</small>
+        </span>
+      </a>
+      <div class="topbar-meta">
+        <span class="local-dot" aria-hidden="true"></span>
+        <span>仅在本机运行</span>
+        <span class="topbar-rule" aria-hidden="true"></span>
+        <span>固定采样 v1.0</span>
+      </div>
+    </header>
+
+    <main class="app-shell" id="main-content">
+      <aside class="control-rail" aria-labelledby="control-title">
+        <div class="rail-heading">
+          <p class="eyebrow">CONTROL / 01</p>
+          <h1 id="control-title">检测中转池的<br /> Codex 订阅构成</h1>
+          <p>
+            输入兼容 OpenAI Responses API 的地址与密钥。系统会采集
+            100 个独立样本，读取每次响应中的 Codex 订阅字段。
+          </p>
+        </div>
+
+        <form id="analysis-form" novalidate>
+          <div class="field-group">
+            <label for="base-url">接口地址</label>
+            <div class="input-frame">
+              <span class="input-prefix" aria-hidden="true">URL</span>
+              <input
+                id="base-url"
+                name="baseUrl"
+                type="url"
+                inputmode="url"
+                autocomplete="url"
+                spellcheck="false"
+                placeholder="https://example.com"
+                required
+              />
+            </div>
+            <p class="field-hint">
+              可填写站点根地址、<code>/v1</code> 或
+              <code>/v1/responses</code>。
+            </p>
+          </div>
+
+          <div class="field-group">
+            <label for="api-key">API Key</label>
+            <div class="input-frame">
+              <span class="input-prefix" aria-hidden="true">KEY</span>
+              <input
+                id="api-key"
+                name="apiKey"
+                type="password"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="sk-••••••••••••"
+                required
+              />
+              <button
+                class="key-toggle"
+                id="key-toggle"
+                type="button"
+                aria-label="显示 API Key"
+                aria-pressed="false"
+              >
+                显示
+              </button>
+            </div>
+            <p class="field-hint">
+              密钥只进入本机服务内存，不写入浏览器存储、日志或导出文件。
+            </p>
+          </div>
+
+          <fieldset class="strategy-card">
+            <legend>固定采样策略</legend>
+            <div class="strategy-grid">
+              <div>
+                <strong>100</strong>
+                <span>逻辑样本</span>
+              </div>
+              <div>
+                <strong>50</strong>
+                <span>最大并发</span>
+              </div>
+              <div>
+                <strong>5</strong>
+                <span>最多尝试</span>
+              </div>
+              <div>
+                <strong>1–3s</strong>
+                <span>随机退避</span>
+              </div>
+            </div>
+          </fieldset>
+
+          <div class="method-note">
+            <span aria-hidden="true">i</span>
+            <p>
+              首个样本会先验证接口；验证成功后才启动剩余并发。成功响应没有订阅字段时记为“未识别”，不会重复请求。
+            </p>
+          </div>
+
+          <button class="primary-action" id="start-button" type="submit">
+            <span>开始 100 次分析</span>
+            <span aria-hidden="true">↗</span>
+          </button>
+          <button class="secondary-action" id="cancel-button" type="button" hidden>
+            停止当前分析
+          </button>
+        </form>
+
+        <p class="quota-note">
+          每次运行最多会产生 500 次上游尝试，并消耗对应账户额度。建议先确认服务条款与可用配额。
+        </p>
+      </aside>
+
+      <section class="dashboard" aria-label="分析结果">
+        <section class="status-panel panel">
+          <div class="status-copy">
+            <div class="status-line">
+              <span class="status-badge is-idle" id="status-badge">
+                <span aria-hidden="true"></span>
+                等待输入
+              </span>
+              <span class="job-id" id="job-id">JOB —</span>
+            </div>
+            <h2 id="stage-title">准备一次可信的分布采样</h2>
+            <p id="stage-description">
+              运行后，这里会实时显示模型验证、并发采样、随机重试与完成状态。
+            </p>
+          </div>
+          <dl class="run-meta">
+            <div>
+              <dt>目标</dt>
+              <dd id="target-meta">—</dd>
+            </div>
+            <div>
+              <dt>模型</dt>
+              <dd id="model-meta">—</dd>
+            </div>
+            <div>
+              <dt>耗时</dt>
+              <dd id="elapsed-meta">00:00</dd>
+            </div>
+          </dl>
+          <div
+            class="progress-track"
+            role="progressbar"
+            aria-label="采样进度"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="0"
+            id="progress-track"
+          >
+            <span id="progress-fill"></span>
+          </div>
+          <div class="progress-caption">
+            <span id="progress-copy">已完成 0 / 100</span>
+            <span id="attempt-copy">累计尝试 0 次</span>
+          </div>
+        </section>
+
+        <section class="error-banner" id="error-banner" role="alert" hidden>
+          <span class="error-mark" aria-hidden="true">!</span>
+          <div>
+            <strong id="error-title">分析未完成</strong>
+            <p id="error-message"></p>
+          </div>
+          <button id="dismiss-error" type="button" aria-label="关闭错误提示">×</button>
+        </section>
+
+        <section class="metric-grid" aria-label="核心指标">
+          <article class="metric-card metric-card--primary">
+            <span>已完成</span>
+            <strong id="completed-metric">0<small>/100</small></strong>
+            <p id="success-metric">等待开始采样</p>
+          </article>
+          <article class="metric-card">
+            <span><i class="legend-dot plan-pro" aria-hidden="true"></i>Pro</span>
+            <strong id="pro-metric">0.0<small>%</small></strong>
+            <p id="pro-count">0 个样本</p>
+          </article>
+          <article class="metric-card">
+            <span><i class="legend-dot plan-plus" aria-hidden="true"></i>Plus</span>
+            <strong id="plus-metric">0.0<small>%</small></strong>
+            <p id="plus-count">0 个样本</p>
+          </article>
+          <article class="metric-card">
+            <span><i class="legend-dot plan-free" aria-hidden="true"></i>Free</span>
+            <strong id="free-metric">0.0<small>%</small></strong>
+            <p id="free-count">0 个样本</p>
+          </article>
+          <article class="metric-card">
+            <span><i class="legend-dot plan-unknown" aria-hidden="true"></i>未识别 / 失败</span>
+            <strong id="unresolved-metric">0.0<small>%</small></strong>
+            <p id="unresolved-count">0 个样本</p>
+          </article>
+          <article class="metric-card">
+            <span>平均响应</span>
+            <strong id="latency-metric">—<small>ms</small></strong>
+            <p>按已完成样本统计</p>
+          </article>
+        </section>
+
+        <section class="sample-panel panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">SAMPLE FIELD / 02</p>
+              <h2>100 次请求光谱</h2>
+            </div>
+            <div class="matrix-legend" aria-label="样本状态图例">
+              <span><i class="plan-pro"></i>Pro</span>
+              <span><i class="plan-plus"></i>Plus</span>
+              <span><i class="plan-free"></i>Free</span>
+              <span><i class="plan-unknown"></i>未识别</span>
+              <span><i class="plan-failed"></i>失败</span>
+            </div>
+          </div>
+          <div
+            class="sample-matrix"
+            id="sample-matrix"
+            aria-label="100 个请求样本，点击查看证据"
+          ></div>
+          <div class="matrix-axis" aria-hidden="true">
+            <span>01</span>
+            <span>样本编号</span>
+            <span>100</span>
+          </div>
+        </section>
+
+        <div class="analysis-grid">
+          <section class="distribution-panel panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">DISTRIBUTION / 03</p>
+                <h2>订阅等级占比</h2>
+              </div>
+            </div>
+            <div class="distribution-body">
+              <div
+                class="donut"
+                id="distribution-donut"
+                role="img"
+                aria-label="订阅等级占比图"
+              >
+                <div>
+                  <strong id="donut-value">0</strong>
+                  <span>已分类</span>
+                </div>
+              </div>
+              <div class="distribution-legend" id="distribution-legend">
+                <p class="empty-copy">完成采样后显示订阅分布。</p>
+              </div>
+            </div>
+            <p class="interpretation-note">
+              百分比的分母固定为 100 个逻辑样本，代表该中转地址在本次采样中的路由分布，不等同于中转池的真实库存。
+            </p>
+          </section>
+
+          <section class="evidence-panel panel" aria-live="polite">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">EVIDENCE / 04</p>
+                <h2 id="evidence-title">样本证据</h2>
+              </div>
+              <span class="sample-index" id="selected-index">#—</span>
+            </div>
+            <div class="empty-evidence" id="empty-evidence">
+              <span aria-hidden="true">⌁</span>
+              <p>点击上方任意样本格，查看该次请求实际命中的订阅字段和限额信息。</p>
+            </div>
+            <dl class="evidence-list" id="evidence-list" hidden></dl>
+          </section>
+        </div>
+
+        <section class="records-panel panel">
+          <div class="panel-heading records-heading">
+            <div>
+              <p class="eyebrow">REQUEST LOG / 05</p>
+              <h2>逐次请求记录</h2>
+            </div>
+            <div class="record-actions">
+              <label class="filter-control" for="record-filter">
+                <span class="sr-only">筛选请求记录</span>
+                <select id="record-filter">
+                  <option value="all">全部状态</option>
+                  <option value="classified">已识别</option>
+                  <option value="unknown">未识别</option>
+                  <option value="failed">失败</option>
+                  <option value="pending">进行中 / 等待</option>
+                </select>
+              </label>
+              <button class="text-button" id="export-json" type="button" disabled>
+                导出 JSON
+              </button>
+              <button class="text-button" id="export-csv" type="button" disabled>
+                导出 CSV
+              </button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">样本</th>
+                  <th scope="col">状态</th>
+                  <th scope="col">订阅等级</th>
+                  <th scope="col">尝试</th>
+                  <th scope="col">HTTP</th>
+                  <th scope="col">响应</th>
+                  <th scope="col">命中字段</th>
+                  <th scope="col"><span class="sr-only">操作</span></th>
+                </tr>
+              </thead>
+              <tbody id="record-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <footer class="dashboard-footer">
+          <span>PlanScope · 本地诊断工具</span>
+          <span>判定优先级：响应头 <code>x-codex-plan-type</code> → 响应体字段</span>
+        </footer>
+      </section>
+    </main>
+  </body>
+</html>
