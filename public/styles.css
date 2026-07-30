@@ -809,6 +809,10 @@ code {
   padding: 20px 21px;
 }
 
+.sample-panel {
+  padding-block: 17px 15px;
+}
+
 .panel-heading {
   display: flex;
   align-items: flex-start;
@@ -833,25 +837,25 @@ code {
 
 .sample-matrix {
   display: grid;
-  grid-template-columns: repeat(10, minmax(28px, 1fr));
-  gap: clamp(4px, 0.52vw, 8px);
-  margin-top: 19px;
+  grid-template-columns: repeat(20, minmax(24px, 1fr));
+  gap: clamp(3px, 0.3vw, 5px);
+  margin-top: 14px;
 }
 
 .sample-cell {
   position: relative;
-  aspect-ratio: 1 / 0.76;
-  min-height: 28px;
+  aspect-ratio: 1 / 0.62;
+  min-height: 24px;
   display: grid;
   place-items: center;
   overflow: hidden;
   padding: 0;
   color: #7c8e9b;
   border: 1px solid #dce4e8;
-  border-radius: 5px;
+  border-radius: 4px;
   background: var(--queued);
   font-family: var(--font-mono);
-  font-size: clamp(7px, 0.66vw, 9px);
+  font-size: clamp(7px, 0.46vw, 8px);
   transition:
     transform 130ms ease,
     border-color 130ms ease,
@@ -926,7 +930,7 @@ code {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-top: 10px;
+  margin-top: 7px;
   color: var(--ink-faint);
   font-family: var(--font-mono);
   font-size: 8px;
