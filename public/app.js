@@ -100,6 +100,8 @@ const elements = {
 let currentSnapshot = createInitialSnapshot();
 let currentJobId = null;
 let eventSource = null;
+let eventStreamSession = 0;
+let reconnectTimer = null;
 let elapsedTimer = null;
 let selectedSampleIndex = null;
 let analysisBusy = false;
@@ -846,53 +848,74 @@ async function createAnalysis(
 
 function connectEventStream(eventsPath) {
   closeEventStream();
-  eventSource = new EventSource(eventsPath);
-  eventSource.addEventListener("snapshot", (event) => {
+  const session = eventStreamSession;
+  const source = new EventSource(eventsPath);
+  eventSource = source;
+  source.addEventListener("snapshot", (event) => {
+    if (session !== eventStreamSession || source !== eventSource) return;
     try {
       currentSnapshot = JSON.parse(event.data);
       currentJobId = currentSnapshot.id;
       render(currentSnapshot);
       if (isTerminal(currentSnapshot.status)) {
-        closeEventStream();
-        stopElapsedTimer();
-        setBusy(false);
-        if (currentSnapshot.status === "failed") {
-          showError(
-            "分析未完成",
-            currentSnapshot.error?.message || "上游接口未能完成采样。",
-          );
-        }
+        finishTerminalAnalysis();
       }
     } catch {
       showError("数据解析失败", "本地服务返回了无法识别的进度数据。");
+      recoverSnapshot(session);
     }
   });
-  eventSource.onerror = () => {
+  source.onerror = () => {
+    if (session !== eventStreamSession || source !== eventSource) return;
     if (!isTerminal(currentSnapshot.status)) {
-      recoverSnapshot();
+      recoverSnapshot(session);
     }
   };
 }
 
-async function recoverSnapshot() {
-  if (!currentJobId) return;
+async function recoverSnapshot(expectedSession = eventStreamSession) {
+  if (
+    !currentJobId ||
+    expectedSession !== eventStreamSession
+  ) {
+    return;
+  }
+  const jobId = currentJobId;
   closeEventStream();
+  const recoverySession = eventStreamSession;
   try {
-    const response = await fetch(`/api/jobs/${currentJobId}`);
+    const response = await fetch(`/api/jobs/${jobId}`);
     const payload = await response.json();
     if (!response.ok) throw new Error(payload?.error?.message);
+    if (
+      recoverySession !== eventStreamSession ||
+      currentJobId !== jobId
+    ) {
+      return;
+    }
     currentSnapshot = payload;
     render(currentSnapshot);
     if (!isTerminal(payload.status)) {
-      window.setTimeout(
-        () => connectEventStream(`/api/jobs/${currentJobId}/events`),
-        900,
-      );
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        if (
+          recoverySession === eventStreamSession &&
+          currentJobId === jobId &&
+          !isTerminal(currentSnapshot.status)
+        ) {
+          connectEventStream(`/api/jobs/${jobId}/events`);
+        }
+      }, 900);
     } else {
-      stopElapsedTimer();
-      setBusy(false);
+      finishTerminalAnalysis();
     }
   } catch {
+    if (
+      recoverySession !== eventStreamSession ||
+      currentJobId !== jobId
+    ) {
+      return;
+    }
     stopElapsedTimer();
     setBusy(false);
     showError(
@@ -914,9 +937,7 @@ async function cancelAnalysis() {
     if (!response.ok) throw new Error(payload?.error?.message);
     currentSnapshot = payload;
     render(currentSnapshot);
-    closeEventStream();
-    stopElapsedTimer();
-    setBusy(false);
+    finishTerminalAnalysis({ showFailure: false });
   } catch (error) {
     elements.cancelButton.disabled = false;
     showError("停止失败", error?.message || "无法停止当前任务。");
@@ -973,7 +994,7 @@ function statusDescription(snapshot) {
     return `本次采样已结束，共识别 ${snapshot.breakdown?.classified || 0} 个有效订阅等级。`;
   }
   if (snapshot.status === "failed") {
-    return "已保留失败前完成的样本，可在下方检查记录和具体原因。";
+    return "任务已自动停止并关闭实时连接；失败前完成的样本仍可检查。";
   }
   if (snapshot.status === "cancelled") {
     return "任务已停止，已完成的样本仍可查看和导出。";
@@ -1326,6 +1347,43 @@ function setBusy(busy) {
   syncControls();
 }
 
+function finishTerminalAnalysis(options = {}) {
+  const status = currentSnapshot.status;
+  const showFailure = options.showFailure !== false;
+  closeEventStream();
+  stopElapsedTimer();
+  currentJobId = null;
+  pendingAnalysis = null;
+  modelsReady = false;
+  modelListSource = null;
+  resetModelSelect("先读取可用模型");
+
+  if (status === "failed") {
+    setModelStatus(
+      "分析已自动停止；请重新填写 API Key 并读取模型后重试。",
+      "is-error",
+    );
+  } else if (status === "cancelled") {
+    setModelStatus(
+      "分析已停止；下次运行请重新填写 API Key 并读取模型。",
+      "is-warning",
+    );
+  } else {
+    setModelStatus(
+      "分析已完成；下次运行请重新填写 API Key 并读取模型。",
+      "is-success",
+    );
+  }
+
+  setBusy(false);
+  if (status === "failed" && showFailure) {
+    showError(
+      "分析已自动停止",
+      currentSnapshot.error?.message || "上游接口未能完成采样。",
+    );
+  }
+}
+
 function syncControls() {
   const cooldownActive = remainingCooldownMs() > 0;
   const locked = analysisBusy || modelLoading || verificationOpen;
@@ -1346,7 +1404,14 @@ function syncControls() {
         ? "等待滑块验证"
         : cooldownActive
           ? `安全冷却 ${formatCooldown(remainingCooldownMs())}`
-          : "开始 100 次分析";
+          : !modelsReady
+            ? "读取模型后开始分析"
+            : "开始 100 次分析";
+  elements.startButton.classList.toggle("is-busy", analysisBusy);
+  elements.startButton.setAttribute(
+    "aria-busy",
+    String(analysisBusy),
+  );
   elements.loadModels.textContent = modelLoading
     ? "读取中…"
     : modelsReady
@@ -1390,6 +1455,9 @@ function stopElapsedTimer() {
 }
 
 function closeEventStream() {
+  eventStreamSession += 1;
+  if (reconnectTimer) window.clearTimeout(reconnectTimer);
+  reconnectTimer = null;
   if (eventSource) eventSource.close();
   eventSource = null;
 }

@@ -582,7 +582,7 @@ async function runJob(job, credentials) {
     } else {
       job.status = "failed";
       job.state.status = "failed";
-      job.state.stage = "分析未完成";
+      job.state.stage = "分析已停止";
       job.state.error = {
         code: error?.code ?? "analysis_failed",
         message: error?.message ?? "分析失败",
@@ -682,6 +682,7 @@ function broadcast(job, immediate = false) {
 
 function emitSnapshot(job) {
   const data = `event: snapshot\ndata: ${JSON.stringify(snapshotJob(job))}\n\n`;
+  const terminal = isTerminal(job.status);
   for (const listener of job.listeners) {
     if (listener.destroyed || listener.writableEnded) {
       job.listeners.delete(listener);
@@ -689,6 +690,10 @@ function emitSnapshot(job) {
     }
     try {
       listener.write(data);
+      if (terminal) {
+        job.listeners.delete(listener);
+        listener.end();
+      }
     } catch {
       job.listeners.delete(listener);
       listener.destroy();
@@ -716,6 +721,10 @@ function openEventStream(request, response, job) {
   response.write(
     `event: snapshot\ndata: ${JSON.stringify(snapshotJob(job))}\n\n`,
   );
+  if (isTerminal(job.status)) {
+    response.end();
+    return;
+  }
   job.listeners.add(response);
 
   const keepAlive = setInterval(() => {

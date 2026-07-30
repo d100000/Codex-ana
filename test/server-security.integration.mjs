@@ -335,6 +335,12 @@ async function verifyJobOwnership() {
     });
     assert.equal(analysis.status, 202);
 
+    const terminalEventsPromise = send({
+      port: appPort,
+      path: analysis.json.events,
+      headers: { Cookie: ownerCookie },
+    });
+
     const ownerRead = await waitForFirstSample(
       appPort,
       analysis.json.location,
@@ -369,6 +375,14 @@ async function verifyJobOwnership() {
       },
     });
     assert.equal(ownerCancel.status, 200);
+
+    const terminalEvents = await withTimeout(
+      terminalEventsPromise,
+      2_000,
+      "终态事件流没有自动关闭。",
+    );
+    assert.equal(terminalEvents.status, 200);
+    assert.match(terminalEvents.text, /"status":"cancelled"/);
 
     const adminLogin = await send({
       port: appPort,
@@ -405,6 +419,7 @@ async function verifyJobOwnership() {
         foreignRead: foreignRead.status,
         foreignCancel: foreignCancel.status,
         ownerCancel: ownerCancel.status,
+        terminalStreamClosed: terminalEvents.status,
         historyRecord: history.status,
         historyDomain: history.json.records[0].domain,
       }),
@@ -446,6 +461,23 @@ async function waitForFirstSample(port, path, cookie) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("等待首个流式 Responses 样本完成超时。");
+}
+
+async function withTimeout(promise, milliseconds, message) {
+  let timeout;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(message)),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function waitForReady(process) {
