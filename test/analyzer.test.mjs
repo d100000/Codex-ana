@@ -10,6 +10,7 @@ import {
   listAvailableModels,
   normalizePlan,
   resolveApiEndpoints,
+  validateApiKey,
 } from "../src/analyzer.mjs";
 
 test("resolveApiEndpoints accepts a root, /v1, or /responses URL", () => {
@@ -38,6 +39,30 @@ test("resolveApiEndpoints rejects unsafe or malformed URLs", () => {
   assert.throws(
     () => resolveApiEndpoints("https://user:pass@gateway.example"),
     /用户名或密码/,
+  );
+  assert.throws(
+    () => resolveApiEndpoints(`https://gateway.example/${"a".repeat(2_100)}`),
+    /长度/,
+  );
+  assert.throws(
+    () =>
+      resolveApiEndpoints("https://gateway.example/sk-secret/v1", {
+        secret: "sk-secret",
+      }),
+    /不能包含 API Key/,
+  );
+});
+
+test("API keys reject control characters and oversized input", () => {
+  assert.equal(validateApiKey("  sk-test  "), "sk-test");
+  assert.throws(
+    () => validateApiKey("sk-test\nInjected: value"),
+    /格式无效/,
+  );
+  assert.throws(() => validateApiKey("sk-测试"), /格式无效/);
+  assert.throws(
+    () => validateApiKey("x".repeat(4_097)),
+    /长度/,
   );
 });
 
@@ -69,6 +94,23 @@ test("body plan_type is used when the response header is absent", () => {
   });
   assert.equal(result.normalized.key, "plus");
   assert.equal(result.source, "response_body:rate_limits.plan_type");
+});
+
+test("untrusted tier values are sanitized and bounded", () => {
+  const result = extractPlanFromResponse(
+    new Headers(),
+    {
+      plan_type: `partner\n${"x".repeat(300)}`,
+    },
+  );
+  assert.equal(result.raw.includes("\n"), false);
+  assert.equal(result.raw.length, 128);
+  assert.equal(
+    extractPlanFromResponse(new Headers(), {
+      plan_type: { nested: "pro" },
+    }),
+    null,
+  );
 });
 
 test("Codex quota evidence is extracted without response content", () => {
@@ -156,6 +198,81 @@ test("model discovery returns selectable IDs and its recommendation", async () =
     "gpt-5.4-mini",
   ]);
   assert.equal(result.source, "models_endpoint");
+});
+
+test("model discovery caps untrusted response size", async () => {
+  await assert.rejects(
+    listAvailableModels({
+      baseUrl: "https://gateway.example",
+      apiKey: "sk-test",
+      fetchImpl: async () =>
+        new Response("x".repeat(513 * 1_024), {
+          headers: { "Content-Type": "application/json" },
+        }),
+    }),
+    (error) => error?.code === "upstream_response_too_large",
+  );
+});
+
+test("upstream errors cannot echo API keys into results", async () => {
+  const apiKey = "sk-sensitive-test-value";
+  await assert.rejects(
+    listAvailableModels({
+      baseUrl: "https://gateway.example",
+      apiKey,
+      fetchImpl: async () =>
+        Response.json(
+          {
+            error: {
+              message: `credential ${apiKey} was rejected`,
+            },
+          },
+          { status: 401 },
+        ),
+    }),
+    (error) =>
+      error?.code === "invalid_credentials" &&
+      !error.message.includes(apiKey) &&
+      error.message.includes("[REDACTED]"),
+  );
+});
+
+test("successful upstream metadata cannot echo API keys into snapshots", async () => {
+  const apiKey = "sk-sensitive-success-value";
+  const state = await analyzeSubscriptionPool({
+    baseUrl: "https://gateway.example",
+    apiKey,
+    model: "gpt-5.5",
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/models")) {
+        return Response.json({ data: [{ id: "gpt-5.5" }] });
+      }
+      return Response.json(
+        { output: [] },
+        {
+          headers: {
+            "x-codex-plan-type": apiKey,
+            "x-request-id": `request-${apiKey}`,
+          },
+        },
+      );
+    },
+    config: {
+      totalRequests: 1,
+      concurrency: 1,
+      maxAttempts: 1,
+      retryMinMs: 1,
+      retryMaxMs: 1,
+      requestTimeoutMs: 5_000,
+    },
+  });
+
+  assert.equal(state.samples[0].status, "unknown");
+  assert.equal(
+    state.samples[0].evidence.upstreamRequestId,
+    "request-[REDACTED]",
+  );
+  assert.equal(JSON.stringify(state).includes(apiKey), false);
 });
 
 test("reasoning effort uses the fastest compatible level", () => {
@@ -332,6 +449,20 @@ test("analyzer rejects a stale model selection before sampling", async () => {
     (error) => error?.code === "model_not_available",
   );
   assert.equal(posts, 0);
+});
+
+test("analyzer rejects an API key copied into the model field", async () => {
+  await assert.rejects(
+    analyzeSubscriptionPool({
+      baseUrl: "https://gateway.example",
+      apiKey: "sk-secret-model-value",
+      model: "prefix-sk-secret-model-value",
+      fetchImpl: async () => {
+        throw new Error("network should not run");
+      },
+    }),
+    (error) => error?.code === "secret_in_model",
+  );
 });
 
 function classified(index, key, label, latencyMs) {

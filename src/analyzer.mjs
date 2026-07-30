@@ -9,6 +9,11 @@ export const DEFAULT_ANALYSIS_CONFIG = Object.freeze({
   requestTimeoutMs: 45_000,
 });
 
+const MAX_UPSTREAM_BODY_BYTES = 512 * 1_024;
+const MAX_MODEL_COUNT = 500;
+const MAX_MODEL_ID_LENGTH = 200;
+const MAX_API_KEY_LENGTH = 4_096;
+
 const COMMON_MODEL_FALLBACKS = Object.freeze([
   "gpt-5.5",
   "gpt-5.4",
@@ -29,10 +34,15 @@ export class AnalysisError extends Error {
   }
 }
 
-export function resolveApiEndpoints(rawUrl) {
+export function resolveApiEndpoints(rawUrl, options = {}) {
   const input = String(rawUrl ?? "").trim();
   if (!input) {
     throw new AnalysisError("请填写 API 地址。", { code: "missing_url" });
+  }
+  if (input.length > 2_048) {
+    throw new AnalysisError("API 地址长度超过安全限制。", {
+      code: "url_too_long",
+    });
   }
 
   let url;
@@ -70,15 +80,30 @@ export function resolveApiEndpoints(rawUrl) {
     ? cleanPath
     : `${apiRootPath}/responses`;
 
-  return {
+  const endpoints = {
     normalizedBaseUrl: `${origin}${apiRootPath}`,
     responsesUrl: `${origin}${responsesPath}`,
     modelsUrl: `${origin}${apiRootPath}/models`,
   };
+  const secret = String(options?.secret ?? "");
+  const encodedSecret = secret ? encodeURIComponent(secret) : "";
+  if (
+    secret.length >= 4 &&
+    Object.values(endpoints).some(
+      (value) =>
+        value.includes(secret) ||
+        (encodedSecret && value.includes(encodedSecret)),
+    )
+  ) {
+    throw new AnalysisError("API 地址中不能包含 API Key。", {
+      code: "secret_in_url",
+    });
+  }
+  return endpoints;
 }
 
 export function normalizePlan(rawPlan) {
-  const source = String(rawPlan ?? "").trim();
+  const source = cleanPlanValue(rawPlan);
   const raw = source
     .trim()
     .toLowerCase()
@@ -116,7 +141,8 @@ export function chooseModel(modelIds) {
           typeof model === "string" ? model : String(model?.id ?? ""),
         )
         .map((id) => id.trim())
-        .filter(Boolean),
+        .filter(isSafeModelId)
+        .slice(0, MAX_MODEL_COUNT),
     ),
   ];
 
@@ -181,7 +207,9 @@ export function fastestReasoningEffort(modelId) {
 }
 
 export function extractPlanFromResponse(headers, payload = null) {
-  const headerPlan = headers?.get?.("x-codex-plan-type");
+  const headerPlan = cleanPlanValue(
+    headers?.get?.("x-codex-plan-type"),
+  );
   if (headerPlan) {
     return {
       raw: headerPlan,
@@ -200,10 +228,11 @@ export function extractPlanFromResponse(headers, payload = null) {
   ];
 
   for (const [source, raw] of candidates) {
-    if (raw !== undefined && raw !== null && String(raw).trim()) {
+    const clean = cleanPlanValue(raw);
+    if (clean) {
       return {
-        raw: String(raw),
-        normalized: normalizePlan(raw),
+        raw: clean,
+        normalized: normalizePlan(clean),
         source,
       };
     }
@@ -225,6 +254,7 @@ export function extractCodexEvidence(headers) {
         .match(/^x-codex-(.+)-primary-used-percent$/);
       if (match && match[1] !== "primary") {
         prefixes.add(match[1]);
+        if (prefixes.size >= 20) break;
       }
     }
 
@@ -269,8 +299,20 @@ export function extractCodexEvidence(headers) {
 
 function cleanHeaderValue(value) {
   if (value === undefined || value === null) return null;
-  const clean = String(value).trim();
+  const clean = String(value)
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim()
+    .slice(0, 512);
   return clean === "" ? null : clean;
+}
+
+function cleanPlanValue(value) {
+  if (value === undefined || value === null) return "";
+  if (!["string", "number"].includes(typeof value)) return "";
+  return String(value)
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim()
+    .slice(0, 128);
 }
 
 function parseFiniteNumber(value) {
@@ -381,17 +423,19 @@ export async function analyzeSubscriptionPool(options) {
     });
   }
 
-  const key = String(apiKey ?? "").trim();
-  if (!key) {
-    throw new AnalysisError("请填写 API Key。", { code: "missing_api_key" });
-  }
+  const key = validateApiKey(apiKey);
   const selectedModel = validateRequestedModel(requestedModel);
+  if (selectedModel && containsSecret(selectedModel, [key])) {
+    throw new AnalysisError("模型名称中不能包含 API Key。", {
+      code: "secret_in_model",
+    });
+  }
 
   const config = validateConfig({
     ...DEFAULT_ANALYSIS_CONFIG,
     ...configOverride,
   });
-  const endpoints = resolveApiEndpoints(baseUrl);
+  const endpoints = resolveApiEndpoints(baseUrl, { secret: key });
   const state = {
     status: "preparing",
     stage: "正在验证地址、密钥和所选模型",
@@ -533,12 +577,9 @@ export async function listAvailableModels(options) {
     });
   }
 
-  const key = String(apiKey ?? "").trim();
-  if (!key) {
-    throw new AnalysisError("请填写 API Key。", { code: "missing_api_key" });
-  }
+  const key = validateApiKey(apiKey);
 
-  const endpoints = resolveApiEndpoints(baseUrl);
+  const endpoints = resolveApiEndpoints(baseUrl, { secret: key });
   const modelIds = await fetchModelIds({
     url: endpoints.modelsUrl,
     apiKey: key,
@@ -556,7 +597,7 @@ export async function listAvailableModels(options) {
   };
 }
 
-function validateRequestedModel(value) {
+export function validateRequestedModel(value) {
   const model = String(value ?? "").trim();
   if (!model) return null;
   if (model.length > 200 || /[\u0000-\u001f\u007f]/.test(model)) {
@@ -565,6 +606,24 @@ function validateRequestedModel(value) {
     });
   }
   return model;
+}
+
+export function validateApiKey(value) {
+  const key = String(value ?? "").trim();
+  if (!key) {
+    throw new AnalysisError("请填写 API Key。", {
+      code: "missing_api_key",
+    });
+  }
+  if (
+    key.length > MAX_API_KEY_LENGTH ||
+    /[^\u0021-\u007e]/.test(key)
+  ) {
+    throw new AnalysisError("API Key 格式无效或长度超过限制。", {
+      code: "invalid_api_key_format",
+    });
+  }
+  return key;
 }
 
 async function fetchModelIds({
@@ -597,9 +656,9 @@ async function fetchModelIds({
     });
   }
 
-  const text = await response.text();
+  const text = await readLimitedResponseText(response);
   if (!response.ok) {
-    const message = extractErrorMessage(text);
+    const message = extractErrorMessage(text, [apiKey]);
     if ([401, 403].includes(response.status)) {
       throw new AnalysisError(`API Key 验证失败：${message}`, {
         code: "invalid_credentials",
@@ -624,7 +683,10 @@ async function fetchModelIds({
       : [];
   return models
     .map((model) => (typeof model === "string" ? model : model?.id))
-    .filter(Boolean);
+    .map((model) => String(model ?? "").trim())
+    .filter(isSafeModelId)
+    .filter((model) => !containsSecret(model, [apiKey]))
+    .slice(0, MAX_MODEL_COUNT);
 }
 
 async function runSingleSample({
@@ -731,13 +793,24 @@ async function runSingleSample({
       return;
     }
 
-    const text = await response.text();
+    let text;
+    try {
+      text = await readLimitedResponseText(response);
+    } catch (error) {
+      const mapped = mapFetchError(error, "读取响应失败");
+      completeFailedSample(sample, mapped, latencyMs, response.status);
+      notify();
+      return;
+    }
     if (!response.ok) {
-      const error = new AnalysisError(extractErrorMessage(text), {
-        code: `http_${response.status}`,
-        status: response.status,
-        retryable: isRetryableStatus(response.status),
-      });
+      const error = new AnalysisError(
+        extractErrorMessage(text, [apiKey]),
+        {
+          code: `http_${response.status}`,
+          status: response.status,
+          retryable: isRetryableStatus(response.status),
+        },
+      );
       const canRetry =
         error.retryable && attempt < config.maxAttempts && !signal?.aborted;
       if (canRetry) {
@@ -761,8 +834,14 @@ async function runSingleSample({
     }
 
     const payload = safeJsonParse(text);
-    const planResult = extractPlanFromResponse(response.headers, payload);
-    const evidence = extractCodexEvidence(response.headers);
+    let planResult = extractPlanFromResponse(response.headers, payload);
+    if (planResult && containsSecret(planResult.raw, [apiKey])) {
+      planResult = null;
+    }
+    const evidence = redactStructuredSecrets(
+      extractCodexEvidence(response.headers),
+      [apiKey],
+    );
 
     Object.assign(sample, {
       status: planResult?.normalized ? "classified" : "unknown",
@@ -848,6 +927,13 @@ function throwIfCancelled(signal) {
 
 function mapFetchError(error, prefix) {
   if (error instanceof AnalysisError) return error;
+  if (error?.code && error?.retryable === false) {
+    return new AnalysisError(error.message || `${prefix}：请求被安全策略阻止。`, {
+      code: error.code,
+      retryable: false,
+      cause: error,
+    });
+  }
   if (error?.name === "AbortError") {
     return new AnalysisError(`${prefix}：请求已取消。`, {
       code: "request_aborted",
@@ -863,20 +949,124 @@ function mapFetchError(error, prefix) {
     });
   }
   return new AnalysisError(`${prefix}：${error?.message ?? "网络错误"}`, {
-    code: "network_error",
-    retryable: true,
+    code: error?.code ?? "network_error",
+    retryable: error?.retryable !== false,
     cause: error,
   });
 }
 
-function extractErrorMessage(text) {
+async function readLimitedResponseText(
+  response,
+  maxBytes = MAX_UPSTREAM_BODY_BYTES,
+) {
+  const declaredLength = Number(response?.headers?.get?.("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new AnalysisError("上游响应内容超过安全限制。", {
+      code: "upstream_response_too_large",
+    });
+  }
+
+  const reader = response?.body?.getReader?.();
+  if (!reader) {
+    const text = await response.text();
+    if (Buffer.byteLength(text) > maxBytes) {
+      throw new AnalysisError("上游响应内容超过安全限制。", {
+        code: "upstream_response_too_large",
+      });
+    }
+    return text;
+  }
+
+  const decoder = new TextDecoder();
+  let size = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel();
+        throw new AnalysisError("上游响应内容超过安全限制。", {
+          code: "upstream_response_too_large",
+        });
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } finally {
+    reader.releaseLock?.();
+  }
+}
+
+function isSafeModelId(value) {
+  return (
+    Boolean(value) &&
+    value.length <= MAX_MODEL_ID_LENGTH &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+function extractErrorMessage(text, secrets = []) {
   const payload = safeJsonParse(text);
   const message =
     payload?.error?.message ??
     payload?.message ??
     payload?.error ??
     String(text ?? "").trim();
-  return String(message || "接口返回未知错误").slice(0, 600);
+  return redactSecrets(
+    String(message || "接口返回未知错误").slice(0, 2_000),
+    secrets,
+  ).slice(0, 600);
+}
+
+function redactStructuredSecrets(value, secrets) {
+  if (typeof value === "string") {
+    return redactSecrets(value, secrets);
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) =>
+      redactStructuredSecrets(entry, secrets),
+    );
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [
+        key,
+        redactStructuredSecrets(entry, secrets),
+      ]),
+    );
+  }
+  return value;
+}
+
+function redactSecrets(value, secrets) {
+  let result = String(value ?? "");
+  for (const secret of secrets) {
+    const candidate = String(secret ?? "");
+    if (candidate.length >= 4) {
+      for (const variant of new Set([
+        candidate,
+        encodeURIComponent(candidate),
+      ])) {
+        result = result.replaceAll(variant, "[REDACTED]");
+      }
+    }
+  }
+  return result;
+}
+
+function containsSecret(value, secrets) {
+  const text = String(value ?? "");
+  return secrets.some((secret) => {
+    const candidate = String(secret ?? "");
+    return (
+      candidate.length >= 4 &&
+      (text.includes(candidate) ||
+        text.includes(encodeURIComponent(candidate)))
+    );
+  });
 }
 
 function safeJsonParse(text) {

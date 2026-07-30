@@ -135,6 +135,38 @@ test("expired challenges and excessive challenge creation are blocked", () => {
   );
 });
 
+test("model lookup probing is limited by both IP and device", () => {
+  const harness = createHarness({
+    maxModelLookupsPerWindow: 2,
+  });
+  harness.protection.reserveModelLookup(identity());
+  harness.advance(1);
+  harness.protection.reserveModelLookup(identity());
+  harness.advance(1);
+
+  assert.throws(
+    () =>
+      harness.protection.reserveModelLookup(
+        identity({ deviceKey: "device-b" }),
+      ),
+    (error) =>
+      error.code === "model_lookup_rate_limited" &&
+      error.httpStatus === 429,
+  );
+  assert.throws(
+    () =>
+      harness.protection.reserveModelLookup(
+        identity({ ipKey: "ip-b" }),
+      ),
+    (error) => error.code === "model_lookup_rate_limited",
+  );
+
+  harness.advance(5 * 60 * 1_000);
+  assert.doesNotThrow(() =>
+    harness.protection.reserveModelLookup(identity()),
+  );
+});
+
 function createHarness(config = {}) {
   let currentTime = 0;
   let tokenIndex = 0;

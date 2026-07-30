@@ -9,7 +9,8 @@
     "dev": "node --watch server.mjs",
     "mock": "node test/mock-upstream.mjs",
     "test": "node --test test/*.test.mjs",
-    "check": "node --check server.mjs && node --check src/analyzer.mjs && node --check public/app.js && node --test test/*.test.mjs"
+    "test:security": "node test/server-security.integration.mjs",
+    "check": "node --check server.mjs && node --check src/analyzer.mjs && node --check src/http-security.mjs && node --check src/safe-fetch.mjs && node --check public/app.js && node --check test/server-security.integration.mjs && node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=20"

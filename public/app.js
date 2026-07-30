@@ -1,4 +1,7 @@
 const FIXED_TOTAL = 100;
+const API_INTENT_HEADERS = Object.freeze({
+  "X-PlanScope-Request": "1",
+});
 
 const PLAN_COLOR_PALETTE = Object.freeze([
   "#315be8",
@@ -254,12 +257,19 @@ async function loadAvailableModels() {
   try {
     const response = await fetch("/api/models", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        ...API_INTENT_HEADERS,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({ baseUrl, apiKey }),
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new Error(payload?.error?.message || "无法读取模型列表。");
+      throw apiErrorFromPayload(
+        payload,
+        "无法读取模型列表。",
+        response.status,
+      );
     }
 
     const models = [
@@ -405,6 +415,7 @@ async function loadVerificationChallenge(
 
     const response = await fetch("/api/verification/challenge", {
       method: "POST",
+      headers: API_INTENT_HEADERS,
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
@@ -535,7 +546,10 @@ async function submitVerification() {
   try {
     const response = await fetch("/api/verification/verify", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        ...API_INTENT_HEADERS,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
         challengeId: verificationChallenge.id,
         finalPosition,
@@ -781,7 +795,10 @@ async function createAnalysis(
   try {
     const response = await fetch("/api/analyze", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        ...API_INTENT_HEADERS,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
         baseUrl,
         apiKey,
@@ -891,6 +908,7 @@ async function cancelAnalysis() {
   try {
     const response = await fetch(`/api/jobs/${currentJobId}/cancel`, {
       method: "POST",
+      headers: API_INTENT_HEADERS,
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload?.error?.message);
@@ -1450,7 +1468,10 @@ function downloadFile(name, content, type) {
 
 function csvCell(value) {
   const text = String(value ?? "");
-  return `"${text.replaceAll('"', '""')}"`;
+  const safeText = /^[\s]*[=+\-@]/.test(text)
+    ? `'${text}`
+    : text;
+  return `"${safeText.replaceAll('"', '""')}"`;
 }
 
 function textCell(value) {

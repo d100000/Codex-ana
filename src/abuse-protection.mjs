@@ -6,6 +6,8 @@ export const DEFAULT_PROTECTION_CONFIG = Object.freeze({
   proofTtlMs: 90 * 1_000,
   challengeWindowMs: 5 * 60 * 1_000,
   maxChallengesPerWindow: 12,
+  modelLookupWindowMs: 5 * 60 * 1_000,
+  maxModelLookupsPerWindow: 6,
   minDragDurationMs: 450,
   maxDragDurationMs: 15_000,
   minTraceSamples: 8,
@@ -43,6 +45,10 @@ export class AbuseProtection {
       device: new Map(),
     };
     this.challengeWindows = {
+      ip: new Map(),
+      device: new Map(),
+    };
+    this.modelLookupWindows = {
       ip: new Map(),
       device: new Map(),
     };
@@ -213,6 +219,54 @@ export class AbuseProtection {
     );
   }
 
+  reserveModelLookup({ ipKey, deviceKey }) {
+    const now = this.now();
+    this.cleanup(now);
+    validateIdentityKeys(ipKey, deviceKey);
+
+    const ipWindow = this.currentWindow(
+      this.modelLookupWindows.ip,
+      ipKey,
+      now,
+      this.config.modelLookupWindowMs,
+    );
+    const deviceWindow = this.currentWindow(
+      this.modelLookupWindows.device,
+      deviceKey,
+      now,
+      this.config.modelLookupWindowMs,
+    );
+    this.assertRollingWindowAvailable(
+      ipWindow,
+      now,
+      this.config.modelLookupWindowMs,
+      this.config.maxModelLookupsPerWindow,
+    );
+    this.assertRollingWindowAvailable(
+      deviceWindow,
+      now,
+      this.config.modelLookupWindowMs,
+      this.config.maxModelLookupsPerWindow,
+    );
+    this.ensureCapacity();
+    this.recordWindow(this.modelLookupWindows.ip, ipKey, ipWindow, now);
+    this.recordWindow(
+      this.modelLookupWindows.device,
+      deviceKey,
+      deviceWindow,
+      now,
+    );
+
+    return {
+      remaining: Math.min(
+        this.config.maxModelLookupsPerWindow - ipWindow.length - 1,
+        this.config.maxModelLookupsPerWindow -
+          deviceWindow.length -
+          1,
+      ),
+    };
+  }
+
   assertCooldownAvailable(ipKey, deviceKey, now) {
     const remainingMs = Math.max(
       0,
@@ -245,8 +299,31 @@ export class AbuseProtection {
     );
   }
 
-  currentWindow(map, key, now) {
-    const cutoff = now - this.config.challengeWindowMs;
+  assertRollingWindowAvailable(
+    window,
+    now,
+    windowMs,
+    maximum,
+  ) {
+    if (window.length < maximum) return;
+    const remainingMs = window[0] + windowMs - now;
+    throw new AbuseProtectionError(
+      "模型列表读取过于频繁，请稍后再试。",
+      {
+        code: "model_lookup_rate_limited",
+        httpStatus: 429,
+        retryAfterSeconds: coarseRetryAfter(remainingMs),
+      },
+    );
+  }
+
+  currentWindow(
+    map,
+    key,
+    now,
+    windowMs = this.config.challengeWindowMs,
+  ) {
+    const cutoff = now - windowMs;
     return (map.get(key) ?? []).filter((timestamp) => timestamp > cutoff);
   }
 
@@ -261,7 +338,9 @@ export class AbuseProtection {
       this.cooldowns.ip.size +
       this.cooldowns.device.size +
       this.challengeWindows.ip.size +
-      this.challengeWindows.device.size;
+      this.challengeWindows.device.size +
+      this.modelLookupWindows.ip.size +
+      this.modelLookupWindows.device.size;
     if (entryCount < this.config.maxStateEntries) return;
 
     throw new AbuseProtectionError(
@@ -294,6 +373,16 @@ export class AbuseProtection {
     }
     for (const map of Object.values(this.challengeWindows)) {
       const cutoff = now - this.config.challengeWindowMs;
+      for (const [key, timestamps] of map) {
+        const current = timestamps.filter(
+          (timestamp) => timestamp > cutoff,
+        );
+        if (current.length > 0) map.set(key, current);
+        else map.delete(key);
+      }
+    }
+    for (const map of Object.values(this.modelLookupWindows)) {
+      const cutoff = now - this.config.modelLookupWindowMs;
       for (const [key, timestamps] of map) {
         const current = timestamps.filter(
           (timestamp) => timestamp > cutoff,

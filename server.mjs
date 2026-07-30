@@ -10,7 +10,6 @@ import {
 import { isIP } from "node:net";
 import {
   AbuseProtection,
-  AbuseProtectionError,
   DEFAULT_PROTECTION_CONFIG,
 } from "./src/abuse-protection.mjs";
 import {
@@ -20,20 +19,81 @@ import {
   calculateBreakdown,
   listAvailableModels,
   resolveApiEndpoints,
+  validateApiKey,
+  validateRequestedModel,
 } from "./src/analyzer.mjs";
+import {
+  assertEmptyRequest,
+  assertJsonRequest,
+  createRequestSecurity,
+  requestIsSecure,
+  securityResponseHeaders,
+} from "./src/http-security.mjs";
+import { createSafeFetch } from "./src/safe-fetch.mjs";
 
 const ROOT_DIR = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = join(ROOT_DIR, "public");
 const HOST = process.env.HOST || "127.0.0.1";
-const PORT = Number(process.env.PORT || 4317);
+const PORT = readIntegerEnv("PORT", 4317, 1, 65_535);
 const TRUST_PROXY = /^(1|true)$/i.test(process.env.TRUST_PROXY ?? "");
-const DEVICE_COOKIE = "planscope_device";
+const FORWARDED_IP_HEADER = readForwardedIpHeader();
+const TRUSTED_PROXY_IPS = new Set([
+  "127.0.0.1",
+  "::1",
+  ...String(process.env.TRUSTED_PROXY_IPS ?? "")
+    .split(",")
+    .map(normalizeIp)
+    .filter(Boolean),
+]);
+const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN ?? "";
+const DEVICE_COOKIE = /^https:\/\//i.test(PUBLIC_ORIGIN.trim())
+  ? "__Host-planscope_device"
+  : "planscope_device";
 const DEVICE_COOKIE_MAX_AGE = 365 * 24 * 60 * 60;
-const identitySecret =
-  process.env.ABUSE_SECRET || randomBytes(32);
+const MAX_ACTIVE_JOBS = readIntegerEnv("MAX_ACTIVE_JOBS", 2, 1, 20);
+const MAX_STORED_JOBS = readIntegerEnv(
+  "MAX_STORED_JOBS",
+  500,
+  10,
+  5_000,
+);
+const MAX_JOB_LISTENERS = readIntegerEnv(
+  "MAX_JOB_LISTENERS",
+  3,
+  1,
+  20,
+);
+const MAX_CONCURRENT_MODEL_LOOKUPS = readIntegerEnv(
+  "MAX_CONCURRENT_MODEL_LOOKUPS",
+  4,
+  1,
+  20,
+);
+const identitySecret = readIdentitySecret();
 const abuseProtection = new AbuseProtection();
+const requestSecurity = createRequestSecurity({
+  bindHost: HOST,
+  port: PORT,
+  trustProxy: TRUST_PROXY,
+  isTrustedProxy: trustedProxyRequest,
+  publicOrigin: PUBLIC_ORIGIN,
+  allowedHosts: process.env.ALLOWED_HOSTS,
+  allowInsecurePublicOrigin: readBooleanEnv(
+    "ALLOW_INSECURE_PUBLIC_ORIGIN",
+  ),
+});
+const upstreamFetch = createSafeFetch({
+  allowHttp: readBooleanEnv("ALLOW_HTTP_UPSTREAMS"),
+  allowPrivateNetworks: readBooleanEnv(
+    "ALLOW_PRIVATE_UPSTREAMS",
+  ),
+  allowedHosts: process.env.ALLOWED_UPSTREAM_HOSTS,
+  allowedPorts: process.env.ALLOWED_UPSTREAM_PORTS,
+});
 const jobs = new Map();
 const TERMINAL_JOB_TTL_MS = 60 * 60 * 1_000;
+let pendingJobStarts = 0;
+let activeModelLookups = 0;
 
 const staticRoutes = new Map([
   ["/", "index.html"],
@@ -42,12 +102,23 @@ const staticRoutes = new Map([
   ["/app.js", "app.js"],
 ]);
 
+class ServiceError extends Error {
+  constructor(message, options = {}) {
+    super(message, options);
+    this.name = "ServiceError";
+    this.code = options.code ?? "service_error";
+    this.httpStatus = options.httpStatus ?? 500;
+    this.retryAfterSeconds = options.retryAfterSeconds ?? null;
+  }
+}
+
 const server = createServer(async (request, response) => {
-  applySecurityHeaders(response);
+  applySecurityHeaders(request, response);
 
   try {
-    const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+    const url = parseRequestUrl(request.url);
     const { pathname } = url;
+    requestSecurity(request, pathname);
 
     if (request.method === "GET" && staticRoutes.has(pathname)) {
       await serveStatic(response, staticRoutes.get(pathname));
@@ -64,6 +135,13 @@ const server = createServer(async (request, response) => {
           cooldownSeconds:
             DEFAULT_PROTECTION_CONFIG.cooldownMs / 1_000,
           dimensions: ["ip", "device"],
+          modelLookupLimit:
+            DEFAULT_PROTECTION_CONFIG.maxModelLookupsPerWindow,
+          ssrfProtection: true,
+          httpsUpstreamsOnly: !upstreamFetch.policy.allowHttp,
+          privateUpstreamsAllowed:
+            upstreamFetch.policy.allowPrivateNetworks,
+          maxActiveJobs: MAX_ACTIVE_JOBS,
         },
       });
       return;
@@ -73,6 +151,7 @@ const server = createServer(async (request, response) => {
       request.method === "POST" &&
       pathname === "/api/verification/challenge"
     ) {
+      assertEmptyRequest(request);
       const identity = identifyClient(request, response);
       const challenge = abuseProtection.issueChallenge(identity);
       sendJson(response, 201, challenge);
@@ -83,6 +162,7 @@ const server = createServer(async (request, response) => {
       request.method === "POST" &&
       pathname === "/api/verification/verify"
     ) {
+      assertJsonRequest(request);
       const body = await readJsonBody(request);
       const identity = identifyClient(request, response);
       const result = abuseProtection.verifyChallenge({
@@ -96,82 +176,121 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && pathname === "/api/models") {
+      assertJsonRequest(request);
+      assertModelLookupCapacity();
       const body = await readJsonBody(request);
-      const result = await listAvailableModels({
-        baseUrl: body?.baseUrl,
-        apiKey: body?.apiKey,
-      });
+      const identity = identifyClient(request, response);
+      abuseProtection.reserveModelLookup(identity);
+      activeModelLookups += 1;
+      let result;
+      try {
+        result = await listAvailableModels({
+          baseUrl: body?.baseUrl,
+          apiKey: body?.apiKey,
+          fetchImpl: upstreamFetch,
+        });
+      } finally {
+        activeModelLookups -= 1;
+      }
 
       sendJson(response, 200, result);
       return;
     }
 
     if (request.method === "POST" && pathname === "/api/analyze") {
+      assertJsonRequest(request);
       const body = await readJsonBody(request);
       const baseUrl = String(body?.baseUrl ?? "").trim();
-      const apiKey = String(body?.apiKey ?? "").trim();
-      const model = String(body?.model ?? "").trim();
+      const apiKey = validateApiKey(body?.apiKey);
+      const model = validateRequestedModel(body?.model);
       const verificationProof = String(
         body?.verificationProof ?? "",
       ).trim();
-      const endpoints = resolveApiEndpoints(baseUrl);
+      const endpoints = resolveApiEndpoints(baseUrl, {
+        secret: apiKey,
+      });
 
-      if (!apiKey) {
-        throw new AnalysisError("请填写 API Key。", {
-          code: "missing_api_key",
-        });
-      }
       if (!model) {
         throw new AnalysisError("请先读取模型列表并选择本次分析模型。", {
           code: "missing_model",
         });
       }
+      if (model.includes(apiKey)) {
+        throw new AnalysisError("模型名称中不能包含 API Key。", {
+          code: "secret_in_model",
+        });
+      }
 
+      assertJobCapacity();
       const identity = identifyClient(request, response);
-      const reservation = abuseProtection.consumeProofAndReserve({
-        proof: verificationProof,
-        ...identity,
-      });
-      const id = randomUUID();
-      const abortController = new AbortController();
-      const job = {
-        id,
-        status: "queued",
-        safeTarget: endpoints.normalizedBaseUrl,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        state: {
+      pendingJobStarts += 1;
+      let reservation;
+      let job;
+      try {
+        reservation = abuseProtection.consumeProofAndReserve({
+          proof: verificationProof,
+          ...identity,
+        });
+        await upstreamFetch.validateUrl(endpoints.modelsUrl);
+        pruneJobs();
+        if (jobs.size >= MAX_STORED_JOBS) {
+          throw new ServiceError(
+            "任务存储已达到安全上限，请稍后再试。",
+            {
+              code: "job_capacity_reached",
+              httpStatus: 503,
+              retryAfterSeconds: 30,
+            },
+          );
+        }
+
+        const id = randomUUID();
+        const abortController = new AbortController();
+        job = {
+          id,
+          ownerDeviceKey: identity.deviceKey,
           status: "queued",
-          stage: "任务已创建",
-          config: DEFAULT_ANALYSIS_CONFIG,
-          selectedModel: model,
-          modelSource: "user_selected",
-          startedAt: null,
-          completedAt: null,
-          samples: Array.from(
-            { length: DEFAULT_ANALYSIS_CONFIG.totalRequests },
-            (_, index) => ({
-              index,
-              status: "queued",
-              attempts: 0,
-            }),
-          ),
-        },
-        abortController,
-        listeners: new Set(),
-        broadcastTimer: null,
-      };
-      job.state.breakdown = calculateBreakdown(
-        job.state.samples,
-        DEFAULT_ANALYSIS_CONFIG.totalRequests,
-      );
-      jobs.set(id, job);
-      runJob(job, { baseUrl, apiKey, model });
+          safeTarget: endpoints.normalizedBaseUrl,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          state: {
+            status: "queued",
+            stage: "任务已创建",
+            config: DEFAULT_ANALYSIS_CONFIG,
+            selectedModel: model,
+            modelSource: "user_selected",
+            startedAt: null,
+            completedAt: null,
+            samples: Array.from(
+              {
+                length:
+                  DEFAULT_ANALYSIS_CONFIG.totalRequests,
+              },
+              (_, index) => ({
+                index,
+                status: "queued",
+                attempts: 0,
+              }),
+            ),
+          },
+          abortController,
+          listeners: new Set(),
+          broadcastTimer: null,
+        };
+        job.state.breakdown = calculateBreakdown(
+          job.state.samples,
+          DEFAULT_ANALYSIS_CONFIG.totalRequests,
+        );
+        jobs.set(id, job);
+        runJob(job, { baseUrl, apiKey, model });
+      } finally {
+        pendingJobStarts -= 1;
+      }
 
       sendJson(response, 202, {
-        jobId: id,
-        location: `/api/jobs/${id}`,
-        events: `/api/jobs/${id}/events`,
+        jobId: job.id,
+        location: `/api/jobs/${job.id}`,
+        events: `/api/jobs/${job.id}/events`,
         nextAllowedAt: new Date(
           reservation.nextAllowedAt,
         ).toISOString(),
@@ -181,7 +300,8 @@ const server = createServer(async (request, response) => {
 
     const jobMatch = pathname.match(/^\/api\/jobs\/([a-f0-9-]+)$/i);
     if (request.method === "GET" && jobMatch) {
-      const job = getJob(jobMatch[1]);
+      const identity = identifyClient(request, response);
+      const job = getOwnedJob(jobMatch[1], identity);
       sendJson(response, 200, snapshotJob(job));
       return;
     }
@@ -190,7 +310,8 @@ const server = createServer(async (request, response) => {
       /^\/api\/jobs\/([a-f0-9-]+)\/events$/i,
     );
     if (request.method === "GET" && eventsMatch) {
-      const job = getJob(eventsMatch[1]);
+      const identity = identifyClient(request, response);
+      const job = getOwnedJob(eventsMatch[1], identity);
       openEventStream(request, response, job);
       return;
     }
@@ -199,7 +320,9 @@ const server = createServer(async (request, response) => {
       /^\/api\/jobs\/([a-f0-9-]+)\/cancel$/i,
     );
     if (request.method === "POST" && cancelMatch) {
-      const job = getJob(cancelMatch[1]);
+      assertEmptyRequest(request);
+      const identity = identifyClient(request, response);
+      const job = getOwnedJob(cancelMatch[1], identity);
       if (!isTerminal(job.status)) {
         job.abortController.abort();
         job.status = "cancelled";
@@ -221,18 +344,20 @@ const server = createServer(async (request, response) => {
     });
   } catch (error) {
     const status =
-      error instanceof AbuseProtectionError
+      Number.isInteger(error?.httpStatus)
         ? error.httpStatus
         : error instanceof AnalysisError
           ? 400
           : 500;
     if (status === 500) {
-      console.error("Unhandled request error:", error);
+      console.error("Unhandled request error:", {
+        name: error?.name,
+        code: error?.code,
+        message: error?.message,
+      });
     }
     const retryAfterSeconds =
-      error instanceof AbuseProtectionError
-        ? error.retryAfterSeconds
-        : null;
+      Number(error?.retryAfterSeconds) || null;
     if (retryAfterSeconds) {
       response.setHeader("Retry-After", String(retryAfterSeconds));
     }
@@ -256,6 +381,7 @@ async function runJob(job, credentials) {
   try {
     const state = await analyzeSubscriptionPool({
       ...credentials,
+      fetchImpl: upstreamFetch,
       signal: job.abortController.signal,
       onUpdate(nextState) {
         job.state = nextState;
@@ -368,11 +494,30 @@ function broadcast(job, immediate = false) {
 function emitSnapshot(job) {
   const data = `event: snapshot\ndata: ${JSON.stringify(snapshotJob(job))}\n\n`;
   for (const listener of job.listeners) {
-    listener.write(data);
+    if (listener.destroyed || listener.writableEnded) {
+      job.listeners.delete(listener);
+      continue;
+    }
+    try {
+      listener.write(data);
+    } catch {
+      job.listeners.delete(listener);
+      listener.destroy();
+    }
   }
 }
 
 function openEventStream(request, response, job) {
+  if (job.listeners.size >= MAX_JOB_LISTENERS) {
+    throw new ServiceError(
+      "当前任务的实时连接过多，请关闭重复页面后重试。",
+      {
+        code: "too_many_event_streams",
+        httpStatus: 429,
+        retryAfterSeconds: 5,
+      },
+    );
+  }
   response.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
@@ -385,24 +530,92 @@ function openEventStream(request, response, job) {
   job.listeners.add(response);
 
   const keepAlive = setInterval(() => {
-    response.write(": keep-alive\n\n");
+    if (!response.destroyed && !response.writableEnded) {
+      response.write(": keep-alive\n\n");
+    }
   }, 15_000);
   keepAlive.unref();
 
-  request.on("close", () => {
+  const cleanup = () => {
     clearInterval(keepAlive);
     job.listeners.delete(response);
-  });
+  };
+  request.once("close", cleanup);
+  response.once("close", cleanup);
+  response.once("error", cleanup);
 }
 
-function getJob(id) {
+function getOwnedJob(id, identity) {
   const job = jobs.get(id);
-  if (!job) {
-    throw new AnalysisError("分析任务不存在或已过期。", {
+  if (!job || job.ownerDeviceKey !== identity.deviceKey) {
+    throw new ServiceError("分析任务不存在或已过期。", {
       code: "job_not_found",
+      httpStatus: 404,
     });
   }
   return job;
+}
+
+function parseRequestUrl(value) {
+  const source = String(value ?? "");
+  if (!source || source.length > 4_096) {
+    throw new ServiceError("请求地址长度超过限制。", {
+      code: "request_target_too_long",
+      httpStatus: 414,
+    });
+  }
+  if (!source.startsWith("/") || source.startsWith("//")) {
+    throw new ServiceError("请求地址格式无效。", {
+      code: "invalid_request_target",
+      httpStatus: 400,
+    });
+  }
+  try {
+    return new URL(source, "http://localhost");
+  } catch {
+    throw new ServiceError("请求地址格式无效。", {
+      code: "invalid_request_target",
+      httpStatus: 400,
+    });
+  }
+}
+
+function assertModelLookupCapacity() {
+  if (activeModelLookups < MAX_CONCURRENT_MODEL_LOOKUPS) return;
+  throw new ServiceError("模型读取服务当前繁忙，请稍后再试。", {
+    code: "model_lookup_capacity_reached",
+    httpStatus: 503,
+    retryAfterSeconds: 10,
+  });
+}
+
+function assertJobCapacity() {
+  pruneJobs();
+  const activeJobs = [...jobs.values()].filter(
+    (job) => !isTerminal(job.status),
+  ).length;
+  if (
+    activeJobs + pendingJobStarts < MAX_ACTIVE_JOBS &&
+    jobs.size < MAX_STORED_JOBS
+  ) {
+    return;
+  }
+  throw new ServiceError("分析服务当前繁忙，请稍后再试。", {
+    code: "analysis_capacity_reached",
+    httpStatus: 503,
+    retryAfterSeconds: 30,
+  });
+}
+
+function pruneJobs(now = Date.now()) {
+  for (const [id, job] of jobs) {
+    if (
+      isTerminal(job.status) &&
+      now - Date.parse(job.updatedAt) >= TERMINAL_JOB_TTL_MS
+    ) {
+      jobs.delete(id);
+    }
+  }
 }
 
 async function serveStatic(response, fileName) {
@@ -410,7 +623,7 @@ async function serveStatic(response, fileName) {
   const data = await readFile(filePath);
   response.writeHead(200, {
     "Content-Type": mimeType(filePath),
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-store",
   });
   response.end(data);
 }
@@ -427,13 +640,26 @@ function mimeType(filePath) {
 }
 
 async function readJsonBody(request) {
+  assertJsonRequest(request);
+  const declaredLength = Number(request.headers["content-length"]);
+  if (
+    Number.isFinite(declaredLength) &&
+    declaredLength > 64 * 1_024
+  ) {
+    throw new ServiceError("请求内容过大。", {
+      code: "request_too_large",
+      httpStatus: 413,
+    });
+  }
+
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
     if (size > 64 * 1_024) {
-      throw new AnalysisError("请求内容过大。", {
+      throw new ServiceError("请求内容过大。", {
         code: "request_too_large",
+        httpStatus: 413,
       });
     }
     chunks.push(chunk);
@@ -476,12 +702,8 @@ function identifyClient(request, response) {
 }
 
 function clientIp(request) {
-  const forwarded = TRUST_PROXY
-    ? firstHeaderValue(
-        request.headers["cf-connecting-ip"] ??
-          request.headers["x-forwarded-for"] ??
-          request.headers["x-real-ip"],
-      )
+  const forwarded = trustedProxyRequest(request)
+    ? firstHeaderValue(request.headers[FORWARDED_IP_HEADER])
     : null;
   const remote = String(
     request.socket?.remoteAddress ?? "unknown",
@@ -489,12 +711,43 @@ function clientIp(request) {
   return normalizeIp(forwarded) || normalizeIp(remote) || "unknown";
 }
 
+function trustedProxyRequest(request) {
+  if (!TRUST_PROXY) return false;
+  const remote = normalizeIp(request.socket?.remoteAddress);
+  return Boolean(remote && TRUSTED_PROXY_IPS.has(remote));
+}
+
 function normalizeIp(value) {
-  let candidate = String(value ?? "").split(",")[0].trim();
-  if (candidate.startsWith("::ffff:")) {
-    candidate = candidate.slice(7);
+  const candidate = String(value ?? "").split(",")[0].trim();
+  const family = isIP(candidate);
+  if (family === 4) {
+    return candidate
+      .split(".")
+      .map((part) => String(Number(part)))
+      .join(".");
   }
-  return isIP(candidate) ? candidate : null;
+  if (family !== 6) return null;
+
+  let canonical;
+  try {
+    canonical = new URL(`http://[${candidate}]/`).hostname.slice(1, -1);
+  } catch {
+    return null;
+  }
+  const mapped = canonical.match(
+    /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i,
+  );
+  if (mapped) {
+    const high = Number.parseInt(mapped[1], 16);
+    const low = Number.parseInt(mapped[2], 16);
+    return [
+      high >> 8,
+      high & 0xff,
+      low >> 8,
+      low & 0xff,
+    ].join(".");
+  }
+  return canonical;
 }
 
 function firstHeaderValue(value) {
@@ -520,20 +773,12 @@ function serializeDeviceCookie(deviceId, request) {
     `Max-Age=${DEVICE_COOKIE_MAX_AGE}`,
     "HttpOnly",
     "SameSite=Strict",
+    "Priority=High",
   ];
-  if (requestIsSecure(request)) attributes.push("Secure");
+  if (applicationRequestIsSecure(request)) {
+    attributes.push("Secure");
+  }
   return attributes.join("; ");
-}
-
-function requestIsSecure(request) {
-  if (request.socket?.encrypted) return true;
-  if (!TRUST_PROXY) return false;
-  return (
-    String(request.headers["x-forwarded-proto"] ?? "")
-      .split(",")[0]
-      .trim()
-      .toLowerCase() === "https"
-  );
 }
 
 function hashIdentity(kind, value) {
@@ -542,19 +787,68 @@ function hashIdentity(kind, value) {
     .digest("base64url");
 }
 
-function applySecurityHeaders(response) {
-  response.setHeader("X-Content-Type-Options", "nosniff");
-  response.setHeader("X-Frame-Options", "DENY");
-  response.setHeader("Referrer-Policy", "no-referrer");
-  response.setHeader(
-    "Content-Security-Policy",
-    "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+function applySecurityHeaders(request, response) {
+  const headers = securityResponseHeaders({
+    secure: applicationRequestIsSecure(request),
+  });
+  for (const [name, value] of Object.entries(headers)) {
+    response.setHeader(name, value);
+  }
+}
+
+function applicationRequestIsSecure(request) {
+  return (
+    requestSecurity.publicOrigin?.startsWith("https://") ||
+    requestIsSecure(request, trustedProxyRequest(request))
   );
+}
+
+function readBooleanEnv(name) {
+  return /^(1|true)$/i.test(process.env[name] ?? "");
+}
+
+function readIntegerEnv(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value >= min && value <= max
+    ? value
+    : fallback;
+}
+
+function readIdentitySecret() {
+  const configured = process.env.ABUSE_SECRET;
+  if (!configured) return randomBytes(32);
+  if (Buffer.byteLength(configured) < 32) {
+    throw new Error("ABUSE_SECRET 必须至少包含 32 字节。");
+  }
+  return configured;
+}
+
+function readForwardedIpHeader() {
+  const header = String(
+    process.env.FORWARDED_IP_HEADER ?? "x-real-ip",
+  )
+    .trim()
+    .toLowerCase();
+  if (
+    !["x-real-ip", "x-forwarded-for", "cf-connecting-ip"].includes(
+      header,
+    )
+  ) {
+    throw new Error("FORWARDED_IP_HEADER 配置无效。");
+  }
+  return header;
 }
 
 function isTerminal(status) {
   return ["completed", "failed", "cancelled"].includes(status);
 }
+
+server.headersTimeout = 10_000;
+server.requestTimeout = 15_000;
+server.keepAliveTimeout = 5_000;
+server.maxHeadersCount = 64;
+server.maxRequestsPerSocket = 100;
+server.maxConnections = 256;
 
 server.listen(PORT, HOST, () => {
   console.log(`Codex PlanScope 已启动：http://${HOST}:${PORT}`);
@@ -562,6 +856,9 @@ server.listen(PORT, HOST, () => {
     `固定策略：${DEFAULT_ANALYSIS_CONFIG.totalRequests} 次请求 / ${DEFAULT_ANALYSIS_CONFIG.concurrency} 并发 / 最多 ${DEFAULT_ANALYSIS_CONFIG.maxAttempts} 次尝试`,
   );
   console.log("防滥用：滑块验证 / IP 与设备独立冷却 5 分钟");
+  console.log(
+    `网络保护：SSRF 防护已启用 / ${upstreamFetch.policy.allowHttp ? "允许显式 HTTP" : "仅 HTTPS"} / 最大并行任务 ${MAX_ACTIVE_JOBS}`,
+  );
 });
 
 function shutdown() {
