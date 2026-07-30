@@ -10,12 +10,13 @@ export const DEFAULT_ANALYSIS_CONFIG = Object.freeze({
 });
 
 const COMMON_MODEL_FALLBACKS = Object.freeze([
+  "gpt-5.5",
+  "gpt-5.4",
   "gpt-5.4-mini",
   "gpt-5.3-codex-spark",
   "gpt-5.3-codex",
   "gpt-5-codex",
   "codex-mini-latest",
-  "gpt-5.4",
 ]);
 
 export class AnalysisError extends Error {
@@ -149,9 +150,12 @@ function scoreModel(modelId) {
   const id = modelId.toLowerCase();
   let score = 0;
 
+  if (id === "gpt-5.5") return 10_000;
+  if (id === "gpt-5.4") return 9_000;
+  if (/^gpt-5\.5(?:[-.].+)$/.test(id)) score += 8_000;
+  if (/^gpt-5\.4(?:[-.].+)$/.test(id)) score += 7_000;
   if (id.includes("codex-spark")) score += 1_500;
   if (id.includes("luna")) score += 1_050;
-  if (id === "gpt-5.4-mini") score += 1_000;
   if (id.includes("mini") || id.includes("compact")) {
     score += 350;
   }
@@ -361,6 +365,7 @@ export async function analyzeSubscriptionPool(options) {
   const {
     baseUrl,
     apiKey,
+    model: requestedModel,
     config: configOverride = {},
     fetchImpl = globalThis.fetch,
     random = Math.random,
@@ -380,6 +385,7 @@ export async function analyzeSubscriptionPool(options) {
   if (!key) {
     throw new AnalysisError("请填写 API Key。", { code: "missing_api_key" });
   }
+  const selectedModel = validateRequestedModel(requestedModel);
 
   const config = validateConfig({
     ...DEFAULT_ANALYSIS_CONFIG,
@@ -388,14 +394,14 @@ export async function analyzeSubscriptionPool(options) {
   const endpoints = resolveApiEndpoints(baseUrl);
   const state = {
     status: "preparing",
-    stage: "正在验证地址和模型",
+    stage: "正在验证地址、密钥和所选模型",
     config,
     endpoints: {
       normalizedBaseUrl: endpoints.normalizedBaseUrl,
       responsesUrl: endpoints.responsesUrl,
     },
-    selectedModel: null,
-    modelSource: null,
+    selectedModel,
+    modelSource: selectedModel ? "user_selected" : null,
     startedAt: new Date().toISOString(),
     completedAt: null,
     error: null,
@@ -418,16 +424,28 @@ export async function analyzeSubscriptionPool(options) {
   notify();
   throwIfCancelled(signal);
 
-  const modelIds = await fetchModelIds({
-    url: endpoints.modelsUrl,
+  const modelInfo = await listAvailableModels({
+    baseUrl,
     apiKey: key,
     fetchImpl,
     signal,
     timeoutMs: Math.min(config.requestTimeoutMs, 20_000),
   });
-  const modelChoice = chooseModel(modelIds);
-  state.selectedModel = modelChoice.selected;
-  state.modelSource = modelChoice.source;
+  if (
+    selectedModel &&
+    modelInfo.source === "models_endpoint" &&
+    !modelInfo.models.includes(selectedModel)
+  ) {
+    throw new AnalysisError(
+      "所选模型不在当前接口返回的模型列表中，请重新读取模型后再试。",
+      {
+        code: "model_not_available",
+      },
+    );
+  }
+
+  state.selectedModel = selectedModel || modelInfo.selected;
+  state.modelSource = selectedModel ? "user_selected" : modelInfo.source;
   state.status = "running";
   state.stage = "正在执行首个有效性样本";
   notify();
@@ -437,7 +455,7 @@ export async function analyzeSubscriptionPool(options) {
     sampleIndex: 0,
     responsesUrl: endpoints.responsesUrl,
     apiKey: key,
-    model: modelChoice.selected,
+    model: state.selectedModel,
     config,
     fetchImpl,
     random,
@@ -478,7 +496,7 @@ export async function analyzeSubscriptionPool(options) {
         sampleIndex: index,
         responsesUrl: endpoints.responsesUrl,
         apiKey: key,
-        model: modelChoice.selected,
+        model: state.selectedModel,
         config,
         fetchImpl,
         random,
@@ -498,6 +516,55 @@ export async function analyzeSubscriptionPool(options) {
   state.completedAt = new Date().toISOString();
   notify();
   return state;
+}
+
+export async function listAvailableModels(options) {
+  const {
+    baseUrl,
+    apiKey,
+    fetchImpl = globalThis.fetch,
+    signal,
+    timeoutMs = 20_000,
+  } = options;
+
+  if (typeof fetchImpl !== "function") {
+    throw new AnalysisError("当前 Node.js 环境不支持 fetch。", {
+      code: "fetch_unavailable",
+    });
+  }
+
+  const key = String(apiKey ?? "").trim();
+  if (!key) {
+    throw new AnalysisError("请填写 API Key。", { code: "missing_api_key" });
+  }
+
+  const endpoints = resolveApiEndpoints(baseUrl);
+  const modelIds = await fetchModelIds({
+    url: endpoints.modelsUrl,
+    apiKey: key,
+    fetchImpl,
+    signal,
+    timeoutMs,
+  });
+  const modelChoice = chooseModel(modelIds);
+
+  return {
+    target: endpoints.normalizedBaseUrl,
+    models: modelChoice.candidates,
+    selected: modelChoice.selected,
+    source: modelChoice.source,
+  };
+}
+
+function validateRequestedModel(value) {
+  const model = String(value ?? "").trim();
+  if (!model) return null;
+  if (model.length > 200 || /[\u0000-\u001f\u007f]/.test(model)) {
+    throw new AnalysisError("所选模型名称无效。", {
+      code: "invalid_model",
+    });
+  }
+  return model;
 }
 
 async function fetchModelIds({

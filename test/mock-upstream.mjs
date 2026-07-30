@@ -15,7 +15,12 @@ const server = createServer(async (request, response) => {
   if (request.method === "GET" && url.pathname === "/v1/models") {
     sendJson(response, 200, {
       object: "list",
-      data: [{ id: "gpt-5.4-mini", object: "model" }],
+      data: [
+        { id: "gpt-5.4-mini", object: "model" },
+        { id: "gpt-5.4", object: "model" },
+        { id: "gpt-5.5", object: "model" },
+        { id: "gpt-5.3-codex-spark", object: "model" },
+      ],
     });
     return;
   }

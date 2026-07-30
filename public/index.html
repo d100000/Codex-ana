@@ -38,8 +38,8 @@
           <p class="eyebrow">CONTROL / 01</p>
           <h1 id="control-title">检测中转池的<br /> Codex 订阅构成</h1>
           <p>
-            输入兼容 OpenAI Responses API 的地址与密钥。系统会采集
-            100 个独立样本，读取每次响应中的 Codex 订阅字段。
+            输入兼容 OpenAI Responses API 的地址与密钥，读取并选择模型后，
+            系统会采集 100 个独立样本，识别响应中的 Codex 订阅字段。
           </p>
         </div>
 
@@ -93,6 +93,30 @@
             </p>
           </div>
 
+          <div class="field-group model-field">
+            <label for="model-select">分析模型</label>
+            <div class="input-frame">
+              <span class="input-prefix" aria-hidden="true">MODEL</span>
+              <select id="model-select" name="model" required disabled>
+                <option value="">先读取可用模型</option>
+              </select>
+              <button
+                class="model-action"
+                id="load-models"
+                type="button"
+              >
+                读取模型
+              </button>
+            </div>
+            <p
+              class="field-hint model-status"
+              id="model-status"
+              aria-live="polite"
+            >
+              每次运行前读取模型；默认优先 GPT-5.5，其次 GPT-5.4。
+            </p>
+          </div>
+
           <fieldset class="strategy-card">
             <legend>固定采样策略</legend>
             <div class="strategy-grid">
@@ -118,11 +142,16 @@
           <div class="method-note">
             <span aria-hidden="true">i</span>
             <p>
-              首个样本会先验证接口；验证成功后才启动剩余并发。成功响应没有订阅字段时记为“未识别”，不会重复请求。
+              本次选择的模型会先由服务端复核；首个样本成功后才启动剩余并发。没有订阅字段的成功响应记为“未识别”。
             </p>
           </div>
 
-          <button class="primary-action" id="start-button" type="submit">
+          <button
+            class="primary-action"
+            id="start-button"
+            type="submit"
+            disabled
+          >
             <span>开始 100 次分析</span>
             <span aria-hidden="true">↗</span>
           </button>

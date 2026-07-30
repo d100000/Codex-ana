@@ -8,6 +8,7 @@ import {
   DEFAULT_ANALYSIS_CONFIG,
   analyzeSubscriptionPool,
   calculateBreakdown,
+  listAvailableModels,
   resolveApiEndpoints,
 } from "./src/analyzer.mjs";
 
@@ -46,15 +47,32 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "POST" && pathname === "/api/models") {
+      const body = await readJsonBody(request);
+      const result = await listAvailableModels({
+        baseUrl: body?.baseUrl,
+        apiKey: body?.apiKey,
+      });
+
+      sendJson(response, 200, result);
+      return;
+    }
+
     if (request.method === "POST" && pathname === "/api/analyze") {
       const body = await readJsonBody(request);
       const baseUrl = String(body?.baseUrl ?? "").trim();
       const apiKey = String(body?.apiKey ?? "").trim();
+      const model = String(body?.model ?? "").trim();
       const endpoints = resolveApiEndpoints(baseUrl);
 
       if (!apiKey) {
         throw new AnalysisError("请填写 API Key。", {
           code: "missing_api_key",
+        });
+      }
+      if (!model) {
+        throw new AnalysisError("请先读取模型列表并选择本次分析模型。", {
+          code: "missing_model",
         });
       }
 
@@ -70,8 +88,8 @@ const server = createServer(async (request, response) => {
           status: "queued",
           stage: "任务已创建",
           config: DEFAULT_ANALYSIS_CONFIG,
-          selectedModel: null,
-          modelSource: null,
+          selectedModel: model,
+          modelSource: "user_selected",
           startedAt: null,
           completedAt: null,
           samples: Array.from(
@@ -92,7 +110,7 @@ const server = createServer(async (request, response) => {
         DEFAULT_ANALYSIS_CONFIG.totalRequests,
       );
       jobs.set(id, job);
-      runJob(job, { baseUrl, apiKey });
+      runJob(job, { baseUrl, apiKey, model });
 
       sendJson(response, 202, {
         jobId: id,

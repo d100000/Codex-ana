@@ -287,7 +287,8 @@ code {
   letter-spacing: 0.07em;
 }
 
-.input-frame input {
+.input-frame input,
+.input-frame select {
   width: 100%;
   min-width: 0;
   padding: 12px 10px 12px 0;
@@ -302,8 +303,22 @@ code {
   color: #99a7b0;
 }
 
-.key-toggle {
+.input-frame select {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.input-frame select:disabled {
+  color: var(--ink-faint);
+  cursor: not-allowed;
+}
+
+.key-toggle,
+.model-action {
   align-self: stretch;
+  flex: 0 0 auto;
   padding: 0 12px;
   color: var(--blue);
   border: 0;
@@ -311,6 +326,28 @@ code {
   background: transparent;
   font-size: 11px;
   font-weight: 700;
+}
+
+.key-toggle:disabled,
+.model-action:disabled {
+  color: var(--ink-faint);
+  cursor: not-allowed;
+}
+
+.model-status.is-loading {
+  color: var(--blue);
+}
+
+.model-status.is-success {
+  color: var(--teal);
+}
+
+.model-status.is-warning {
+  color: var(--amber);
+}
+
+.model-status.is-error {
+  color: var(--red);
 }
 
 .field-hint {
@@ -1316,6 +1353,10 @@ tbody tr.is-selected td {
   .method-note,
   .primary-action,
   .secondary-action {
+    grid-column: 1 / -1;
+  }
+
+  .model-field {
     grid-column: 1 / -1;
   }
 

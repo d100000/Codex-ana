@@ -39,6 +39,9 @@ const elements = {
   baseUrl: document.querySelector("#base-url"),
   apiKey: document.querySelector("#api-key"),
   keyToggle: document.querySelector("#key-toggle"),
+  modelSelect: document.querySelector("#model-select"),
+  loadModels: document.querySelector("#load-models"),
+  modelStatus: document.querySelector("#model-status"),
   startButton: document.querySelector("#start-button"),
   cancelButton: document.querySelector("#cancel-button"),
   statusBadge: document.querySelector("#status-badge"),
@@ -87,6 +90,10 @@ let currentJobId = null;
 let eventSource = null;
 let elapsedTimer = null;
 let selectedSampleIndex = null;
+let analysisBusy = false;
+let modelLoading = false;
+let modelsReady = false;
+let modelListSource = null;
 
 initialize();
 
@@ -94,6 +101,7 @@ function initialize() {
   buildSampleMatrix();
   wireInteractions();
   render(currentSnapshot);
+  syncControls();
 }
 
 function createInitialSnapshot() {
@@ -153,6 +161,10 @@ function wireInteractions() {
   elements.form.addEventListener("submit", startAnalysis);
   elements.cancelButton.addEventListener("click", cancelAnalysis);
   elements.keyToggle.addEventListener("click", toggleKeyVisibility);
+  elements.loadModels.addEventListener("click", loadAvailableModels);
+  elements.modelSelect.addEventListener("change", handleModelChange);
+  elements.baseUrl.addEventListener("input", invalidateModelSelection);
+  elements.apiKey.addEventListener("input", invalidateModelSelection);
   elements.dismissError.addEventListener("click", hideError);
   elements.recordFilter.addEventListener("change", renderRecords);
   elements.exportJson.addEventListener("click", exportJson);
@@ -169,15 +181,156 @@ function wireInteractions() {
   });
 }
 
+async function loadAvailableModels() {
+  hideError();
+
+  const baseUrl = elements.baseUrl.value.trim();
+  let apiKey = elements.apiKey.value.trim();
+  if (!baseUrl || !apiKey) {
+    showError("缺少必要信息", "请先填写接口地址和 API Key，再读取模型。");
+    (!baseUrl ? elements.baseUrl : elements.apiKey).focus();
+    return;
+  }
+
+  modelLoading = true;
+  modelsReady = false;
+  modelListSource = null;
+  resetModelSelect("正在读取模型…");
+  setModelStatus("正在从当前接口读取可用模型…", "is-loading");
+  syncControls();
+
+  try {
+    const response = await fetch("/api/models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ baseUrl, apiKey }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(payload?.error?.message || "无法读取模型列表。");
+    }
+
+    const models = [
+      ...new Set(
+        (Array.isArray(payload?.models) ? payload.models : [])
+          .map((model) => String(model ?? "").trim())
+          .filter(Boolean),
+      ),
+    ];
+    if (models.length === 0) {
+      throw new Error("当前接口没有返回可供分析的模型。");
+    }
+
+    const recommended = models.includes(payload?.selected)
+      ? payload.selected
+      : models[0];
+    const fragment = document.createDocumentFragment();
+    for (const model of models) {
+      const option = document.createElement("option");
+      option.value = model;
+      option.textContent =
+        model === recommended ? `${model} — 推荐` : model;
+      fragment.append(option);
+    }
+    elements.modelSelect.replaceChildren(fragment);
+    elements.modelSelect.value = recommended;
+    modelsReady = true;
+    modelListSource = payload?.source || "models_endpoint";
+
+    if (modelListSource === "fallback") {
+      setModelStatus(
+        `模型接口不可用，已加载 ${models.length} 个兼容候选；请确认中转支持 ${recommended}。`,
+        "is-warning",
+      );
+    } else {
+      setModelStatus(
+        `已读取 ${models.length} 个模型，推荐 ${recommended}；可为本次分析改选。`,
+        "is-success",
+      );
+    }
+  } catch (error) {
+    resetModelSelect("读取失败，请重试");
+    setModelStatus(
+      error?.message || "模型列表读取失败。",
+      "is-error",
+    );
+    showError("无法读取模型", error?.message || "无法连接本地服务。");
+  } finally {
+    apiKey = "";
+    modelLoading = false;
+    syncControls();
+  }
+}
+
+function handleModelChange() {
+  const model = elements.modelSelect.value;
+  if (!modelsReady || !model) {
+    syncControls();
+    return;
+  }
+
+  if (modelListSource === "fallback") {
+    setModelStatus(
+      `本次将使用 ${model}；这是兼容候选，接口未返回真实模型列表。`,
+      "is-warning",
+    );
+  } else {
+    setModelStatus(`本次分析将使用 ${model}。`, "is-success");
+  }
+  syncControls();
+}
+
+function invalidateModelSelection() {
+  if (analysisBusy || modelLoading) return;
+  if (
+    !modelsReady &&
+    !elements.modelSelect.value &&
+    elements.modelSelect.options.length === 1
+  ) {
+    syncControls();
+    return;
+  }
+
+  modelsReady = false;
+  modelListSource = null;
+  resetModelSelect("先读取可用模型");
+  setModelStatus(
+    "地址或密钥已变化，请重新读取模型；默认优先 GPT-5.5，其次 GPT-5.4。",
+  );
+  syncControls();
+}
+
+function resetModelSelect(label) {
+  const option = document.createElement("option");
+  option.value = "";
+  option.textContent = label;
+  elements.modelSelect.replaceChildren(option);
+}
+
+function setModelStatus(message, stateClass = "") {
+  elements.modelStatus.textContent = message;
+  elements.modelStatus.className =
+    `field-hint model-status ${stateClass}`.trim();
+}
+
 async function startAnalysis(event) {
   event.preventDefault();
   hideError();
 
   const baseUrl = elements.baseUrl.value.trim();
   const apiKey = elements.apiKey.value.trim();
+  const model = elements.modelSelect.value;
   if (!baseUrl || !apiKey) {
     showError("缺少必要信息", "请同时填写接口地址和 API Key。");
     (!baseUrl ? elements.baseUrl : elements.apiKey).focus();
+    return;
+  }
+  if (!modelsReady || !model) {
+    showError(
+      "尚未选择模型",
+      "请先读取当前接口的模型列表，并选择本次分析要使用的模型。",
+    );
+    elements.loadModels.focus();
     return;
   }
 
@@ -191,6 +344,7 @@ async function startAnalysis(event) {
     status: "queued",
     stage: "正在创建本地分析任务",
     target: safeDisplayUrl(baseUrl),
+    selectedModel: model,
     startedAt: new Date().toISOString(),
   };
   setBusy(true);
@@ -200,7 +354,7 @@ async function startAnalysis(event) {
     const response = await fetch("/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ baseUrl, apiKey }),
+      body: JSON.stringify({ baseUrl, apiKey, model }),
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
@@ -209,6 +363,13 @@ async function startAnalysis(event) {
 
     currentJobId = payload.jobId;
     elements.apiKey.value = "";
+    modelsReady = false;
+    modelListSource = null;
+    setModelStatus(
+      `本次已锁定 ${model}；下次运行请重新填写密钥并读取模型。`,
+      "is-success",
+    );
+    syncControls();
     startElapsedTimer();
     connectEventStream(payload.events);
   } catch (error) {
@@ -700,14 +861,29 @@ function selectSample(index, scrollToEvidence) {
 }
 
 function setBusy(busy) {
-  elements.startButton.disabled = busy;
-  elements.startButton.firstElementChild.textContent = busy
+  analysisBusy = busy;
+  syncControls();
+}
+
+function syncControls() {
+  const locked = analysisBusy || modelLoading;
+  elements.baseUrl.disabled = locked;
+  elements.apiKey.disabled = locked;
+  elements.keyToggle.disabled = locked;
+  elements.loadModels.disabled = locked;
+  elements.modelSelect.disabled = locked || !modelsReady;
+  elements.startButton.disabled =
+    locked || !modelsReady || !elements.modelSelect.value;
+  elements.startButton.firstElementChild.textContent = analysisBusy
     ? "分析正在进行"
     : "开始 100 次分析";
-  elements.cancelButton.hidden = !busy;
+  elements.loadModels.textContent = modelLoading
+    ? "读取中…"
+    : modelsReady
+      ? "重新读取"
+      : "读取模型";
+  elements.cancelButton.hidden = !analysisBusy;
   elements.cancelButton.disabled = false;
-  elements.baseUrl.disabled = busy;
-  elements.apiKey.disabled = busy;
 }
 
 function toggleKeyVisibility() {

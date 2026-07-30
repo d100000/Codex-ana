@@ -7,6 +7,7 @@ import {
   extractCodexEvidence,
   extractPlanFromResponse,
   fastestReasoningEffort,
+  listAvailableModels,
   normalizePlan,
   resolveApiEndpoints,
 } from "../src/analyzer.mjs";
@@ -107,16 +108,54 @@ test("breakdown percentages always use the logical sample total", () => {
   assert.equal(breakdown.averageLatencyMs, 15);
 });
 
-test("model choice prefers an ultra-fast Codex-compatible model", () => {
+test("model choice defaults to GPT-5.5 when it is available", () => {
   const choice = chooseModel([
     "gpt-image-1",
     "gpt-5.4",
+    "gpt-5.5",
     "gpt-5.3-codex",
     "gpt-5.4-mini",
     "gpt-5.3-codex-spark",
   ]);
-  assert.equal(choice.selected, "gpt-5.3-codex-spark");
+  assert.equal(choice.selected, "gpt-5.5");
   assert.equal(choice.source, "models_endpoint");
+});
+
+test("model choice falls back to GPT-5.4 before model variants", () => {
+  const choice = chooseModel([
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+    "gpt-5.4",
+  ]);
+  assert.equal(choice.selected, "gpt-5.4");
+});
+
+test("model discovery returns selectable IDs and its recommendation", async () => {
+  const result = await listAvailableModels({
+    baseUrl: "https://gateway.example",
+    apiKey: "sk-test",
+    fetchImpl: async (url, options) => {
+      assert.equal(String(url), "https://gateway.example/v1/models");
+      assert.equal(options.method, "GET");
+      assert.equal(options.headers.Authorization, "Bearer sk-test");
+      return Response.json({
+        data: [
+          { id: "gpt-5.4-mini" },
+          { id: "gpt-5.4" },
+          { id: "gpt-5.5" },
+        ],
+      });
+    },
+  });
+
+  assert.equal(result.target, "https://gateway.example/v1");
+  assert.equal(result.selected, "gpt-5.5");
+  assert.deepEqual(result.models, [
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+  ]);
+  assert.equal(result.source, "models_endpoint");
 });
 
 test("reasoning effort uses the fastest compatible level", () => {
@@ -169,6 +208,7 @@ test("analyzer observes concurrency and classifies arbitrary tier values", async
   const state = await analyzeSubscriptionPool({
     baseUrl: "https://gateway.example",
     apiKey: "sk-test",
+    model: "gpt-5.4-mini",
     fetchImpl,
     config: {
       totalRequests: 20,
@@ -182,6 +222,8 @@ test("analyzer observes concurrency and classifies arbitrary tier values", async
   });
 
   assert.equal(state.status, "completed");
+  assert.equal(state.selectedModel, "gpt-5.4-mini");
+  assert.equal(state.modelSource, "user_selected");
   assert.equal(postCount, 20);
   assert.ok(maxActive <= 5, `max active was ${maxActive}`);
   assert.equal(state.breakdown.completed, 20);
@@ -242,6 +284,7 @@ test("retryable failures wait 1–3 seconds and reuse one logical sample", async
   const state = await analyzeSubscriptionPool({
     baseUrl: "https://gateway.example/v1",
     apiKey: "sk-test",
+    model: "gpt-5.4-mini",
     fetchImpl,
     random: () => 0.5,
     sleep: async (ms) => waits.push(ms),
@@ -261,6 +304,34 @@ test("retryable failures wait 1–3 seconds and reuse one logical sample", async
   assert.deepEqual([...attempts.values()], [2, 2, 2, 2]);
   assert.equal(waits.length, 4);
   assert.ok(waits.every((wait) => wait >= 1_000 && wait <= 3_000));
+});
+
+test("analyzer rejects a stale model selection before sampling", async () => {
+  let posts = 0;
+  await assert.rejects(
+    analyzeSubscriptionPool({
+      baseUrl: "https://gateway.example",
+      apiKey: "sk-test",
+      model: "gpt-5.5",
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/models")) {
+          return Response.json({ data: [{ id: "gpt-5.4" }] });
+        }
+        posts += 1;
+        return Response.json({ output: [] });
+      },
+      config: {
+        totalRequests: 1,
+        concurrency: 1,
+        maxAttempts: 1,
+        retryMinMs: 1,
+        retryMaxMs: 1,
+        requestTimeoutMs: 5_000,
+      },
+    }),
+    (error) => error?.code === "model_not_available",
+  );
+  assert.equal(posts, 0);
 });
 
 function classified(index, key, label, latencyMs) {
