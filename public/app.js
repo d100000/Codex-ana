@@ -91,6 +91,7 @@ const elements = {
   evidenceTitle: document.querySelector("#evidence-title"),
   emptyEvidence: document.querySelector("#empty-evidence"),
   evidenceList: document.querySelector("#evidence-list"),
+  streamDetails: document.querySelector("#stream-details"),
   failureDetails: document.querySelector("#failure-details"),
   recordFilter: document.querySelector("#record-filter"),
   recordBody: document.querySelector("#record-body"),
@@ -119,6 +120,10 @@ let verificationReturnFocus = null;
 let pendingAnalysis = null;
 let cooldownUntil = 0;
 let cooldownTimer = null;
+const sampleDetailCache = new Map();
+const sampleDetailRequests = new Map();
+const sampleDetailErrors = new Map();
+let sampleDetailSession = 0;
 
 initialize();
 
@@ -781,6 +786,7 @@ async function createAnalysis(
 
   closeEventStream();
   stopElapsedTimer();
+  resetSampleDetails();
   planColorRegistry.clear();
   selectedSampleIndex = null;
   currentJobId = null;
@@ -1274,13 +1280,16 @@ function renderRecords() {
 }
 
 function renderEvidence() {
-  const sample =
+  const summary =
     selectedSampleIndex === null
       ? null
       : currentSnapshot.samples?.[selectedSampleIndex];
+  const sample = resolveDetailedSample(summary);
   if (!sample) {
     elements.emptyEvidence.hidden = false;
     elements.evidenceList.hidden = true;
+    elements.streamDetails.hidden = true;
+    elements.streamDetails.replaceChildren();
     elements.failureDetails.hidden = true;
     elements.failureDetails.replaceChildren();
     elements.selectedIndex.textContent = "#—";
@@ -1339,7 +1348,38 @@ function renderEvidence() {
     fragment.append(wrapper);
   }
   elements.evidenceList.replaceChildren(fragment);
+  renderStreamDetails(sample);
   renderFailureDetails(sample);
+  loadSampleDetailsIfNeeded(summary);
+}
+
+function renderStreamDetails(sample) {
+  const trace = sample.responseTrace;
+  elements.streamDetails.replaceChildren();
+  elements.streamDetails.hidden =
+    !trace || !Array.isArray(trace.records);
+  if (elements.streamDetails.hidden) return;
+
+  const heading = document.createElement("div");
+  heading.className = "stream-details-heading";
+  const title = document.createElement("h3");
+  title.textContent =
+    `完整流式响应 · ${trace.recordCount ?? trace.records.length} 条`;
+  const note = document.createElement("p");
+  note.textContent = [
+    trace.transport || "未知传输",
+    trace.terminalEvent || "无终态事件",
+    Number.isFinite(trace.bodyBytes)
+      ? formatBytes(trace.bodyBytes)
+      : "大小未知",
+  ].join(" · ");
+  heading.append(title, note);
+
+  elements.streamDetails.append(
+    heading,
+    createStreamMetaGrid(trace),
+    createStreamRecordList(trace),
+  );
 }
 
 function renderFailureDetails(sample) {
@@ -1397,9 +1437,124 @@ function renderFailureDetails(sample) {
         failure.response?.bodyTruncated,
       ),
     );
+    if (failure.responseTrace) {
+      content.append(
+        createDiagnosticBlock(
+          "失败前收到的流式记录",
+          formatStreamRecords(failure.responseTrace),
+          failure.responseTrace.truncated,
+        ),
+      );
+    }
     details.append(content);
     elements.failureDetails.append(details);
   });
+}
+
+function createStreamMetaGrid(trace) {
+  const grid = document.createElement("dl");
+  grid.className = "failure-meta-grid stream-meta-grid";
+  const items = [
+    ["传输", trace.transport || "—"],
+    ["终态事件", trace.terminalEvent || "—"],
+    [
+      "事件 / 记录",
+      `${trace.eventCount ?? 0} / ${trace.recordCount ?? trace.records?.length ?? 0}`,
+    ],
+    [
+      "响应大小",
+      Number.isFinite(trace.bodyBytes)
+        ? formatBytes(trace.bodyBytes)
+        : "—",
+    ],
+    ["上游请求 ID", trace.requestId || "—"],
+    [
+      "HTTP / 耗时",
+      `${trace.status ?? "—"} / ${trace.latencyMs ?? "—"} ms`,
+    ],
+  ];
+  for (const [label, value] of items) {
+    const wrapper = document.createElement("div");
+    const term = document.createElement("dt");
+    const detail = document.createElement("dd");
+    term.textContent = label;
+    detail.textContent = value;
+    wrapper.append(term, detail);
+    grid.append(wrapper);
+  }
+  return grid;
+}
+
+function createStreamRecordList(trace) {
+  const list = document.createElement("div");
+  list.className = "stream-record-list";
+  const records = Array.isArray(trace.records) ? trace.records : [];
+  if (records.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "stream-record-empty";
+    const detailError = sampleDetailErrors.get(
+      sampleDetailKey(currentSnapshot.id, selectedSampleIndex),
+    );
+    empty.textContent = detailError
+      ? `完整事件读取失败：${detailError}`
+      : (trace.recordCount ?? 0) > 0
+        ? "正在按需读取完整流式事件…"
+        : "该响应没有可展示的流式事件。";
+    list.append(empty);
+    return list;
+  }
+
+  records.forEach((record, index) => {
+    const details = document.createElement("details");
+    details.className = "stream-record";
+    details.open = index === records.length - 1;
+    const summary = document.createElement("summary");
+    const title = document.createElement("strong");
+    title.textContent =
+      `#${String(record.index ?? index + 1).padStart(3, "0")} · ${record.event || "message"}`;
+    const type = document.createElement("span");
+    type.textContent = record.type || "message";
+    summary.append(title, type);
+    const pre = document.createElement("pre");
+    pre.textContent = formatStreamRecordData(record.data);
+    details.append(summary, pre);
+    list.append(details);
+  });
+
+  if (trace.truncated) {
+    const warning = document.createElement("p");
+    warning.className = "stream-record-warning";
+    warning.textContent =
+      "事件序列已达到安全存储上限，末尾记录未写入日志。";
+    list.append(warning);
+  }
+  return list;
+}
+
+function formatStreamRecords(trace) {
+  const records = Array.isArray(trace?.records)
+    ? trace.records
+    : [];
+  if (records.length === 0) return "—";
+  return records
+    .map((record, index) => {
+      const event = record.event || record.type || "message";
+      return [
+        `#${String(record.index ?? index + 1).padStart(3, "0")}`,
+        `event: ${event}`,
+        `data: ${formatStreamRecordData(record.data)}`,
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+function formatStreamRecordData(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return "事件内容无法格式化。";
+  }
 }
 
 function createFailureMetaGrid(request, failure) {
@@ -1468,6 +1623,114 @@ function selectSample(index, scrollToEvidence) {
       .querySelector(".evidence-panel")
       .scrollIntoView({ behavior: "smooth", block: "start" });
   }
+}
+
+function resetSampleDetails() {
+  sampleDetailSession += 1;
+  sampleDetailCache.clear();
+  sampleDetailRequests.clear();
+  sampleDetailErrors.clear();
+}
+
+function sampleDetailKey(jobId, index) {
+  return jobId && Number.isInteger(index)
+    ? `${jobId}:${index}`
+    : "";
+}
+
+function resolveDetailedSample(summary) {
+  if (!summary) return null;
+  const key = sampleDetailKey(currentSnapshot.id, summary.index);
+  const cached = key ? sampleDetailCache.get(key) : null;
+  if (
+    cached &&
+    cached.status === summary.status &&
+    cached.attempts === summary.attempts
+  ) {
+    return cached;
+  }
+  return summary;
+}
+
+function loadSampleDetailsIfNeeded(summary) {
+  if (
+    !summary ||
+    !currentSnapshot.id ||
+    !["classified", "unknown", "failed"].includes(summary.status)
+  ) {
+    return;
+  }
+  const traces = [
+    summary.responseTrace,
+    ...(summary.failureDetails || []).map(
+      (failure) => failure.responseTrace,
+    ),
+  ].filter(Boolean);
+  if (
+    !traces.some(
+      (trace) =>
+        (trace.recordCount ?? 0) >
+        (Array.isArray(trace.records) ? trace.records.length : 0),
+    )
+  ) {
+    return;
+  }
+
+  const jobId = currentSnapshot.id;
+  const key = sampleDetailKey(jobId, summary.index);
+  if (
+    !key ||
+    sampleDetailCache.has(key) ||
+    sampleDetailRequests.has(key) ||
+    sampleDetailErrors.has(key)
+  ) {
+    return;
+  }
+
+  const session = sampleDetailSession;
+  const requestPromise = fetch(
+    `/api/jobs/${encodeURIComponent(jobId)}/samples/${summary.index + 1}`,
+  )
+    .then(async (response) => {
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload?.sample) {
+        throw apiErrorFromPayload(
+          payload,
+          "无法读取完整流式事件。",
+          response.status,
+        );
+      }
+      if (
+        session !== sampleDetailSession ||
+        currentSnapshot.id !== jobId
+      ) {
+        return;
+      }
+      sampleDetailCache.set(key, payload.sample);
+      sampleDetailErrors.delete(key);
+      if (selectedSampleIndex === summary.index) {
+        renderEvidence();
+      }
+    })
+    .catch((error) => {
+      if (
+        session !== sampleDetailSession ||
+        currentSnapshot.id !== jobId
+      ) {
+        return;
+      }
+      sampleDetailErrors.set(
+        key,
+        error?.message || "样本明细已过期。",
+      );
+      if (selectedSampleIndex === summary.index) {
+        renderEvidence();
+      }
+    })
+    .finally(() => {
+      sampleDetailRequests.delete(key);
+    });
+  sampleDetailRequests.set(key, requestPromise);
 }
 
 function setBusy(busy) {
@@ -1629,6 +1892,9 @@ function exportCsv() {
     "failure_request_id",
     "failure_response_body",
     "failure_response_truncated",
+    "stream_transport",
+    "stream_terminal_event",
+    "stream_event_count",
   ];
   const rows = (currentSnapshot.samples || []).map((sample) => {
     const failure = sample.failureDetails?.at?.(-1);
@@ -1650,6 +1916,11 @@ function exportCsv() {
       failure?.response?.requestId || "",
       failure?.response?.body || "",
       failure?.response?.bodyTruncated ? "true" : "false",
+      sample.responseTrace?.transport || "",
+      sample.responseTrace?.terminalEvent || "",
+      sample.responseTrace?.recordCount ??
+        sample.responseTrace?.records?.length ??
+        0,
     ];
   });
   const csv = [headings, ...rows]
@@ -1759,6 +2030,16 @@ function formatMinutes(minutes) {
   if (value % 1_440 === 0) return `${value / 1_440} 天`;
   if (value % 60 === 0) return `${value / 60} 小时`;
   return `${value} 分钟`;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1_024) return `${Math.round(bytes)} B`;
+  if (bytes < 1_024 * 1_024) {
+    return `${(bytes / 1_024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1_024 * 1_024)).toFixed(1)} MB`;
 }
 
 function formatPercent(value) {

@@ -1438,6 +1438,114 @@ body.is-verifying {
   line-height: 1.45;
 }
 
+.stream-details {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.stream-details[hidden] {
+  display: none;
+}
+
+.stream-details-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.stream-details-heading h3 {
+  margin: 0;
+  color: #205f74;
+  font-size: 11px;
+}
+
+.stream-details-heading p {
+  margin: 0;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  line-height: 1.45;
+  text-align: right;
+}
+
+.stream-record-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.stream-record {
+  overflow: hidden;
+  border: 1px solid rgba(36, 111, 136, 0.22);
+  border-radius: 7px;
+  background: #f8fbfc;
+}
+
+.stream-record summary {
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.stream-record summary::marker {
+  color: #247a95;
+}
+
+.stream-record summary strong {
+  overflow: hidden;
+  color: #205f74;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stream-record summary span {
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 7.5px;
+  white-space: nowrap;
+}
+
+.stream-record pre {
+  max-height: 260px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  color: #253946;
+  border-top: 1px solid rgba(36, 111, 136, 0.16);
+  background: #fff;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.stream-record-empty,
+.stream-record-warning {
+  margin: 0;
+  padding: 9px 10px;
+  border-radius: 6px;
+  color: var(--ink-faint);
+  background: #f6f8f9;
+  font-size: 8.5px;
+  line-height: 1.5;
+}
+
+.stream-record-warning {
+  color: #8c5a08;
+  background: #fff8e9;
+}
+
 .failure-details {
   margin-top: 14px;
   padding-top: 14px;
@@ -1987,6 +2095,24 @@ tbody tr.is-selected td {
 
   .evidence-panel .panel-heading {
     display: flex;
+  }
+
+  .stream-details-heading {
+    display: block;
+  }
+
+  .stream-details-heading p {
+    margin-top: 5px;
+    text-align: left;
+  }
+
+  .stream-record summary {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+  }
+
+  .stream-record summary span {
+    padding-left: 14px;
   }
 
   .records-heading {

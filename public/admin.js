@@ -88,8 +88,20 @@ const elements = {
   requestLogResponseBody: document.querySelector(
     "#request-log-response-body",
   ),
+  requestLogResponseTitle: document.querySelector(
+    "#request-log-response-title",
+  ),
   requestLogTruncated: document.querySelector(
     "#request-log-truncated",
+  ),
+  requestLogStreamSection: document.querySelector(
+    "#request-log-stream-section",
+  ),
+  requestLogStreamBody: document.querySelector(
+    "#request-log-stream-body",
+  ),
+  requestLogStreamTruncated: document.querySelector(
+    "#request-log-stream-truncated",
   ),
   dialog: document.querySelector("#history-dialog"),
   dialogTitle: document.querySelector("#history-dialog-title"),
@@ -194,7 +206,7 @@ function wireInteractions() {
     const record = requestLogs.find(
       (entry) => entry.requestId === button.dataset.requestLogId,
     );
-    if (record) showRequestLogDetails(record);
+    if (record) void loadRequestLogDetails(record, button);
   });
   elements.body.addEventListener("click", (event) => {
     const button = event.target.closest("[data-history-id]");
@@ -420,7 +432,7 @@ function createRequestLogRow(record) {
   if (record.scope === "upstream") {
     const scope = document.createElement("span");
     scope.className = "admin-log-scope";
-    scope.textContent = "上游失败";
+    scope.textContent = "上游请求";
     pathCell.append(scope);
   }
   const path = document.createElement("code");
@@ -462,8 +474,15 @@ function createRequestLogRow(record) {
   metaCell.className = "admin-log-meta";
   const error = document.createElement("strong");
   const requestId = document.createElement("span");
-  error.textContent = record.errorCode ?? "—";
-  error.title = record.errorCode ?? "";
+  error.textContent =
+    record.errorCode ??
+    record.plan ??
+    formatOutcome(record.outcome);
+  error.title =
+    record.errorMessage ??
+    record.source ??
+    record.outcome ??
+    "";
   requestId.textContent = record.requestId;
   requestId.title = record.requestId;
   metaCell.append(error, requestId);
@@ -475,7 +494,7 @@ function createRequestLogRow(record) {
     action.textContent = "查看明细";
     action.setAttribute(
       "aria-label",
-      `查看样本 ${record.sampleIndex ?? "—"} 第 ${record.attempt ?? "—"} 次尝试的失败明细`,
+      `查看样本 ${record.sampleIndex ?? "—"} 第 ${record.attempt ?? "—"} 次尝试的完整流式响应`,
     );
     metaCell.append(action);
   }
@@ -493,13 +512,36 @@ function createRequestLogRow(record) {
   return row;
 }
 
+async function loadRequestLogDetails(summary, button) {
+  const previousText = button.textContent;
+  button.disabled = true;
+  button.textContent = "读取中…";
+  try {
+    const result = await apiRequest(
+      `/api/admin/request-logs/${encodeURIComponent(summary.requestId)}`,
+    );
+    showRequestLogDetails(result.record);
+  } catch (error) {
+    if (error.status === 401) {
+      showLogin();
+      setLoginMessage("管理会话已过期，请重新登录。");
+      return;
+    }
+    showRequestLogError(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = previousText;
+  }
+}
+
 function showRequestLogDetails(record) {
   const response = record.responseDetail || {};
   const request = record.requestSummary || {};
+  const trace = record.streamTrace || null;
   const upstreamStatus =
     record.upstreamStatus ?? response.status ?? null;
   elements.requestLogDialogTitle.textContent =
-    record.domain || "上游失败请求";
+    `${record.domain || "上游请求"} · ${formatOutcome(record.outcome)}`;
   elements.requestLogDialogSubtitle.textContent =
     `${formatFullDate(record.occurredAt)} · 样本 #${formatSampleIndex(record.sampleIndex)} · 尝试 ${record.attempt ?? "—"}`;
   elements.requestLogDetailGrid.replaceChildren();
@@ -508,6 +550,9 @@ function showRequestLogDetails(record) {
     ["模型", record.model ?? "—"],
     ["HTTP 状态", upstreamStatus ?? "未收到响应"],
     ["耗时", formatDuration(record.durationMs)],
+    ["结果", formatOutcome(record.outcome)],
+    ["订阅等级", record.plan ?? "—"],
+    ["命中字段", record.source ?? "—"],
     ["错误代码", record.errorCode ?? "—"],
     ["错误信息", record.errorMessage ?? "—"],
     ["上游请求 ID", response.requestId ?? "—"],
@@ -515,6 +560,19 @@ function showRequestLogDetails(record) {
     ["CF-Ray", response.cfRay ?? "—"],
     ["Retry-After", response.retryAfter ?? "—"],
     ["请求地址", request.endpoint ?? `${record.domain ?? ""}${record.path}`],
+    ["流式传输", trace?.transport ?? "—"],
+    [
+      "流式事件",
+      trace
+        ? `${trace.eventCount ?? 0} 个事件 / ${trace.recordCount ?? trace.records?.length ?? 0} 条记录`
+        : "—",
+    ],
+    [
+      "响应大小",
+      Number.isFinite(trace?.bodyBytes)
+        ? formatBytes(trace.bodyBytes)
+        : "—",
+    ],
   ];
   for (const [label, value] of details) {
     const wrapper = document.createElement("div");
@@ -529,10 +587,51 @@ function showRequestLogDetails(record) {
 
   elements.requestLogRequestBody.textContent =
     formatRequestSummaryBody(request.body);
+  elements.requestLogResponseTitle.textContent = record.errorCode
+    ? "上游返回报错"
+    : "上游响应摘要";
   elements.requestLogResponseBody.textContent =
-    response.body || record.errorMessage || "上游未返回响应正文。";
+    response.body ||
+    record.errorMessage ||
+    (trace
+      ? "完整响应内容请查看下方流式事件。"
+      : "上游未返回响应正文。");
   elements.requestLogTruncated.hidden = !response.bodyTruncated;
+  elements.requestLogStreamSection.hidden = !trace;
+  elements.requestLogStreamBody.textContent =
+    trace ? formatStreamTrace(trace) : "—";
+  elements.requestLogStreamTruncated.hidden = !trace?.truncated;
   elements.requestLogDialog.showModal();
+}
+
+function formatStreamTrace(trace) {
+  const records = Array.isArray(trace?.records)
+    ? trace.records
+    : [];
+  if (records.length === 0) return "该响应没有可展示的流式事件。";
+  return records
+    .map((record, index) => {
+      const event = record.event || record.type || "message";
+      const data =
+        typeof record.data === "string"
+          ? record.data
+          : JSON.stringify(record.data, null, 2);
+      return [
+        `#${String(record.index ?? index + 1).padStart(3, "0")}`,
+        `event: ${event}`,
+        `data: ${data}`,
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+function formatOutcome(value) {
+  return {
+    classified: "已识别",
+    unknown: "未识别",
+    failed: "失败",
+    cancelled: "已取消",
+  }[value] || "请求完成";
 }
 
 function formatRequestSummaryBody(body) {
@@ -954,6 +1053,16 @@ function formatDuration(value) {
   const seconds = Math.round(value / 100) / 10;
   if (seconds < 60) return `${seconds}s`;
   return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1_024) return `${Math.round(bytes)} B`;
+  if (bytes < 1_024 * 1_024) {
+    return `${(bytes / 1_024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1_024 * 1_024)).toFixed(1)} MB`;
 }
 
 function formatLatency(value) {

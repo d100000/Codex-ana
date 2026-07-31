@@ -21,6 +21,8 @@ const MAX_MODEL_ID_LENGTH = 200;
 const MAX_API_KEY_LENGTH = 4_096;
 const MAX_FAILURE_RESPONSE_CHARS = 4_096;
 const MAX_FAILURE_DETAILS = 10;
+const SENSITIVE_STRUCTURED_FIELD =
+  /(?:^|[-_])(?:api[-_]?key|authorization|proxy[-_]?authorization|access[-_]?token|refresh[-_]?token|auth[-_]?token|id[-_]?token|token|secret|password|passwd|cookie|set[-_]?cookie|credential|credentials|private[-_]?key)(?:$|[-_])/i;
 
 const COMMON_MODEL_FALLBACKS = Object.freeze([
   "gpt-5.5",
@@ -42,6 +44,10 @@ export class AnalysisError extends Error {
     this.diagnosticBody =
       typeof options.diagnosticBody === "string"
         ? options.diagnosticBody
+        : null;
+    this.streamTrace =
+      options.streamTrace && typeof options.streamTrace === "object"
+        ? options.streamTrace
         : null;
   }
 }
@@ -785,15 +791,13 @@ async function runSingleSample({
       });
     } catch (error) {
       const mapped = mapFetchError(error, "请求失败");
-      if (!signal?.aborted) {
-        appendFailureDetail(sample, {
-          attempt,
-          attemptStartedAt,
-          latencyMs: performance.now() - started,
-          error: mapped,
-          secrets: [apiKey],
-        });
-      }
+      appendFailureDetail(sample, {
+        attempt,
+        attemptStartedAt,
+        latencyMs: performance.now() - started,
+        error: mapped,
+        secrets: [apiKey],
+      });
       const canRetry =
         mapped.retryable && attempt < config.maxAttempts && !signal?.aborted;
       if (canRetry) {
@@ -908,24 +912,31 @@ async function runSingleSample({
       return;
     }
 
-    let payload;
+    let readResult;
     try {
-      ({ payload } = await readResponsesPayload(response, {
+      readResult = await readResponsesPayload(response, {
         secrets: [apiKey],
-      }));
+      });
     } catch (error) {
       const mapped = mapFetchError(error, "读取 Responses 流失败");
-      if (!signal?.aborted) {
-        appendFailureDetail(sample, {
-          attempt,
-          attemptStartedAt,
-          latencyMs: performance.now() - started,
-          response,
-          responseBody: mapped.diagnosticBody,
-          error: mapped,
-          secrets: [apiKey],
-        });
-      }
+      const responseTrace = mapped.streamTrace
+        ? createResponseTrace(response, mapped.streamTrace, {
+            attempt,
+            occurredAt: attemptStartedAt,
+            latencyMs: performance.now() - started,
+            secrets: [apiKey],
+          })
+        : null;
+      appendFailureDetail(sample, {
+        attempt,
+        attemptStartedAt,
+        latencyMs: performance.now() - started,
+        response,
+        responseBody: mapped.diagnosticBody,
+        responseTrace,
+        error: mapped,
+        secrets: [apiKey],
+      });
       const canRetry =
         mapped.retryable && attempt < config.maxAttempts && !signal?.aborted;
       if (canRetry) {
@@ -953,6 +964,7 @@ async function runSingleSample({
       return;
     }
     const latencyMs = Math.round(performance.now() - started);
+    const { payload, streamTrace } = readResult;
     let planResult = extractPlanFromResponse(response.headers, payload);
     if (planResult && containsSecret(planResult.raw, [apiKey])) {
       planResult = null;
@@ -970,6 +982,12 @@ async function runSingleSample({
       httpStatus: response.status,
       latencyMs,
       evidence,
+      responseTrace: createResponseTrace(response, streamTrace, {
+        attempt,
+        occurredAt: attemptStartedAt,
+        latencyMs,
+        secrets: [apiKey],
+      }),
       error: null,
       nextRetryMs: null,
       completedAt: new Date().toISOString(),
@@ -987,6 +1005,7 @@ function appendFailureDetail(
     latencyMs,
     response = null,
     responseBody = null,
+    responseTrace = null,
     error,
     secrets = [],
   },
@@ -1038,6 +1057,10 @@ function appendFailureDetail(
       }) || "未知错误",
     },
     response: responseDetail,
+    responseTrace:
+      responseTrace && typeof responseTrace === "object"
+        ? redactStructuredSecrets(responseTrace, secrets)
+        : null,
   };
   sample.failureDetails = [
     ...(Array.isArray(sample.failureDetails)
@@ -1059,6 +1082,55 @@ function safeResponseHeader(headers, names, secrets) {
   return "";
 }
 
+function createResponseTrace(
+  response,
+  streamTrace,
+  {
+    attempt,
+    occurredAt,
+    latencyMs,
+    secrets = [],
+  },
+) {
+  const headers = response?.headers;
+  return redactStructuredSecrets(
+    {
+      attempt: Math.max(1, Math.trunc(Number(attempt) || 1)),
+      occurredAt,
+      latencyMs: Math.max(0, Math.round(Number(latencyMs) || 0)),
+      status: Number(response?.status) || null,
+      statusText:
+        sanitizeDiagnosticText(response?.statusText, {
+          secrets,
+          maxLength: 120,
+        }) || null,
+      contentType:
+        safeResponseHeader(headers, ["content-type"], secrets) || null,
+      requestId:
+        safeResponseHeader(
+          headers,
+          [
+            "x-request-id",
+            "openai-request-id",
+            "x-oneapi-request-id",
+            "request-id",
+          ],
+          secrets,
+        ) || null,
+      transport: streamTrace?.transport ?? null,
+      terminalEvent: streamTrace?.terminalEvent ?? null,
+      eventCount: streamTrace?.eventCount ?? 0,
+      recordCount: streamTrace?.recordCount ?? 0,
+      bodyBytes: streamTrace?.bodyBytes ?? null,
+      doneMarker: streamTrace?.doneMarker === true,
+      records: Array.isArray(streamTrace?.records)
+        ? streamTrace.records
+        : [],
+    },
+    secrets,
+  );
+}
+
 function completeFailedSample(sample, error, latencyMs, status = null) {
   Object.assign(sample, {
     status: "failed",
@@ -1068,6 +1140,7 @@ function completeFailedSample(sample, error, latencyMs, status = null) {
     rawPlan: null,
     source: null,
     evidence: null,
+    responseTrace: null,
     error: serializeError(error),
     nextRetryMs: null,
     completedAt: new Date().toISOString(),
@@ -1126,11 +1199,22 @@ function throwIfCancelled(signal) {
 
 function mapFetchError(error, prefix) {
   if (error instanceof AnalysisError) return error;
+  const inheritedDiagnostics = {
+    diagnosticBody:
+      typeof error?.diagnosticBody === "string"
+        ? error.diagnosticBody
+        : null,
+    streamTrace:
+      error?.streamTrace && typeof error.streamTrace === "object"
+        ? error.streamTrace
+        : null,
+  };
   if (error?.code && error?.retryable === false) {
     return new AnalysisError(error.message || `${prefix}：请求被安全策略阻止。`, {
       code: error.code,
       retryable: false,
       cause: error,
+      ...inheritedDiagnostics,
     });
   }
   if (error?.name === "AbortError") {
@@ -1138,6 +1222,7 @@ function mapFetchError(error, prefix) {
       code: "request_aborted",
       retryable: false,
       cause: error,
+      ...inheritedDiagnostics,
     });
   }
   if (error?.name === "TimeoutError") {
@@ -1145,12 +1230,14 @@ function mapFetchError(error, prefix) {
       code: "request_timeout",
       retryable: true,
       cause: error,
+      ...inheritedDiagnostics,
     });
   }
   return new AnalysisError(`${prefix}：${error?.message ?? "网络错误"}`, {
     code: error?.code ?? "network_error",
     retryable: error?.retryable !== false,
     cause: error,
+    ...inheritedDiagnostics,
   });
 }
 
@@ -1167,17 +1254,45 @@ export async function readResponsesPayload(response, options = {}) {
     const text = await readLimitedResponseText(response, maxBytes);
     if (looksLikeResponsesEventStream(text)) {
       const parser = createResponsesEventStreamParser(secrets);
-      parser.push(text, true);
-      return {
-        ...parser.finish(),
-        transport: "sse_compat",
-      };
+      try {
+        parser.push(text, true);
+        return parser.finish({
+          transport: "sse_compat",
+          bodyBytes: Buffer.byteLength(text),
+        });
+      } catch (error) {
+        attachStreamTrace(error, parser.trace({
+          transport: "sse_compat",
+          bodyBytes: Buffer.byteLength(text),
+        }));
+        throw error;
+      }
     }
+    const payload = safeJsonParse(text);
     return {
-      payload: safeJsonParse(text),
+      payload,
       transport: "json_compat",
       terminalEvent: null,
       eventCount: 0,
+      streamTrace: {
+        transport: "json_compat",
+        terminalEvent: null,
+        eventCount: 0,
+        recordCount: 1,
+        bodyBytes: Buffer.byteLength(text),
+        doneMarker: false,
+        records: [
+          {
+            index: 1,
+            event: "response.json",
+            type: "response.json",
+            data:
+              payload === null
+                ? sanitizeStreamText(text, secrets)
+                : redactStructuredSecrets(payload, secrets),
+          },
+        ],
+      },
     };
   }
 
@@ -1197,8 +1312,19 @@ export async function readResponsesPayload(response, options = {}) {
       });
     }
     const parser = createResponsesEventStreamParser(secrets);
-    parser.push(text, true);
-    return parser.finish();
+    try {
+      parser.push(text, true);
+      return parser.finish({
+        transport: "sse",
+        bodyBytes: Buffer.byteLength(text),
+      });
+    } catch (error) {
+      attachStreamTrace(error, parser.trace({
+        transport: "sse",
+        bodyBytes: Buffer.byteLength(text),
+      }));
+      throw error;
+    }
   }
 
   const decoder = new TextDecoder();
@@ -1218,8 +1344,15 @@ export async function readResponsesPayload(response, options = {}) {
       parser.push(decoder.decode(value, { stream: true }));
     }
     parser.push(decoder.decode(), true);
-    return parser.finish();
+    return parser.finish({
+      transport: "sse",
+      bodyBytes: size,
+    });
   } catch (error) {
+    attachStreamTrace(error, parser.trace({
+      transport: "sse",
+      bodyBytes: size,
+    }));
     await reader.cancel(error).catch(() => {});
     throw error;
   } finally {
@@ -1237,6 +1370,7 @@ function createResponsesEventStreamParser(secrets) {
   let sawDoneMarker = false;
   let sawText = false;
   let finished = false;
+  const records = [];
 
   const dispatch = () => {
     if (dataLines.length === 0) {
@@ -1251,6 +1385,12 @@ function createResponsesEventStreamParser(secrets) {
     if (!data) return;
     if (data === "[DONE]") {
       sawDoneMarker = true;
+      records.push({
+        index: records.length + 1,
+        event: declaredEventName || "done",
+        type: "done",
+        data: "[DONE]",
+      });
       return;
     }
 
@@ -1261,6 +1401,12 @@ function createResponsesEventStreamParser(secrets) {
       const diagnostic = createDiagnosticExcerpt(data, {
         secrets,
         maxLength: MAX_FAILURE_RESPONSE_CHARS,
+      });
+      records.push({
+        index: records.length + 1,
+        event: declaredEventName || "message",
+        type: "invalid_json",
+        data: diagnostic.text,
       });
       throw new AnalysisError(
         "Responses 流包含无法解析的 SSE JSON 事件。",
@@ -1280,6 +1426,12 @@ function createResponsesEventStreamParser(secrets) {
     }
 
     const type = cleanStreamEventType(event?.type || declaredEventName);
+    records.push({
+      index: records.length + 1,
+      event: cleanStreamEventType(declaredEventName) || type || "message",
+      type: type || "message",
+      data: redactStructuredSecrets(event, secrets),
+    });
     if (type === "error" || type === "response.failed") {
       throw createResponsesStreamError(event, type, secrets);
     }
@@ -1365,7 +1517,23 @@ function createResponsesEventStreamParser(secrets) {
     }
   };
 
-  const finish = () => {
+  const trace = ({
+    transport = "sse",
+    bodyBytes = null,
+  } = {}) => ({
+    transport,
+    terminalEvent,
+    eventCount,
+    recordCount: records.length,
+    bodyBytes:
+      Number.isInteger(bodyBytes) && bodyBytes >= 0
+        ? bodyBytes
+        : null,
+    doneMarker: sawDoneMarker,
+    records,
+  });
+
+  const finish = (meta = {}) => {
     if (finished) {
       throw new AnalysisError("Responses 流被重复结束。", {
         code: "invalid_responses_stream_state",
@@ -1383,15 +1551,37 @@ function createResponsesEventStreamParser(secrets) {
         },
       );
     }
+    const streamTrace = trace(meta);
     return {
       payload: terminalPayload,
-      transport: "sse",
+      transport: streamTrace.transport,
       terminalEvent,
       eventCount,
+      streamTrace,
     };
   };
 
-  return { push, finish };
+  return { push, finish, trace };
+}
+
+function attachStreamTrace(error, streamTrace) {
+  if (
+    error &&
+    typeof error === "object" &&
+    streamTrace &&
+    typeof streamTrace === "object"
+  ) {
+    error.streamTrace = streamTrace;
+  }
+}
+
+function sanitizeStreamText(value, secrets) {
+  return redactSecrets(value, secrets)
+    .replace(/\r\n?/g, "\n")
+    .replace(
+      /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,
+      " ",
+    );
 }
 
 function looksLikeResponsesEventStream(text) {
@@ -1526,10 +1716,15 @@ function redactStructuredSecrets(value, secrets) {
   }
   if (value && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [
-        key,
-        redactStructuredSecrets(entry, secrets),
-      ]),
+      Object.entries(value)
+        .filter(([key]) => !SENSITIVE_STRUCTURED_FIELD.test(key))
+        .map(([key, entry]) => [
+          sanitizeDiagnosticText(key, {
+            secrets,
+            maxLength: 200,
+          }),
+          redactStructuredSecrets(entry, secrets),
+        ]),
     );
   }
   return value;

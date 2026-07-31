@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import {
   createDiagnosticExcerpt,
+  redactSensitiveText,
   sanitizeDiagnosticText,
 } from "./redaction.mjs";
 
@@ -18,6 +19,10 @@ const REQUEST_LOG_SCHEMA_VERSION = 1;
 export const REQUEST_LOG_RETENTION_MS = 24 * 60 * 60 * 1_000;
 export const REQUEST_LOG_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
 const STATUS_GROUPS = new Set(["2xx", "3xx", "4xx", "5xx"]);
+const MAX_STREAM_TRACE_BYTES = 768 * 1_024;
+const MAX_STREAM_TRACE_RECORDS = 10_000;
+const SENSITIVE_STRUCTURED_FIELD =
+  /(?:^|[-_])(?:api[-_]?key|authorization|proxy[-_]?authorization|access[-_]?token|refresh[-_]?token|auth[-_]?token|id[-_]?token|token|secret|password|passwd|cookie|set[-_]?cookie|credential|credentials|private[-_]?key)(?:$|[-_])/i;
 const METHODS = new Set([
   "GET",
   "HEAD",
@@ -55,10 +60,17 @@ export class RequestLogStore {
       7 * 24 * 60 * 60 * 1_000,
       REQUEST_LOG_RETENTION_MS,
     );
+    this.maxBytes = clampInteger(
+      options.maxBytes,
+      1 * 1_024 * 1_024,
+      1 * 1_024 * 1_024 * 1_024,
+      256 * 1_024 * 1_024,
+    );
     this.now = typeof options.now === "function"
       ? options.now
       : () => Date.now();
     this.records = [];
+    this.totalBytes = 0;
     this.writeQueue = Promise.resolve();
     this.needsCompaction = false;
     this.initialized = false;
@@ -83,6 +95,7 @@ export class RequestLogStore {
         )
         .slice(-this.maxRecords)
         .reverse();
+      this.applyStorageBounds();
       await this.persistSnapshot(this.records);
     } catch (error) {
       if (error?.code !== "ENOENT") {
@@ -111,22 +124,36 @@ export class RequestLogStore {
       this.needsCompaction = true;
     }
     this.records.unshift(entry);
-    if (this.records.length > this.maxRecords) {
-      this.records.length = this.maxRecords;
+    this.totalBytes += storedRecordBytes(entry);
+    if (this.applyStorageBounds()) {
       this.needsCompaction = true;
     }
 
     const line = `${serializeStoredRecord(entry)}\n`;
+    const shouldCompact = this.needsCompaction;
+    const snapshot = shouldCompact
+      ? structuredClone(this.records)
+      : null;
+    if (shouldCompact) this.needsCompaction = false;
     this.writeQueue = this.writeQueue
       .catch(() => undefined)
       .then(async () => {
+        if (snapshot) {
+          await this.persistSnapshot(snapshot);
+          return;
+        }
         await appendFile(this.filePath, line, {
           encoding: "utf8",
           mode: 0o600,
         });
         await chmod(this.filePath, 0o600);
       });
-    await this.writeQueue;
+    try {
+      await this.writeQueue;
+    } catch (error) {
+      if (shouldCompact) this.needsCompaction = true;
+      throw error;
+    }
     return structuredClone(entry);
   }
 
@@ -185,7 +212,9 @@ export class RequestLogStore {
       }
       return true;
     });
-    const records = filtered.slice(offset, offset + limit);
+    const records = filtered
+      .slice(offset, offset + limit)
+      .map(summarizeRequestLogRecord);
 
     return {
       records: structuredClone(records),
@@ -198,6 +227,20 @@ export class RequestLogStore {
       retentionSeconds: Math.trunc(this.retentionMs / 1_000),
       stats: calculateRequestStats(this.records),
     };
+  }
+
+  get(requestId) {
+    this.assertInitialized();
+    if (this.pruneInMemory(this.now())) {
+      this.needsCompaction = true;
+      void this.compact().catch(() => undefined);
+    }
+    const id = safeIdentifier(requestId);
+    if (!id) return null;
+    const record = this.records.find(
+      (entry) => entry.requestId === id,
+    );
+    return record ? structuredClone(record) : null;
   }
 
   async purgeExpired() {
@@ -236,6 +279,32 @@ export class RequestLogStore {
         (record) => Date.parse(record.occurredAt) >= cutoff,
       )
       .slice(0, this.maxRecords);
+    this.totalBytes = this.records.reduce(
+      (total, record) => total + storedRecordBytes(record),
+      0,
+    );
+    this.applyStorageBounds();
+    return this.records.length !== before;
+  }
+
+  applyStorageBounds() {
+    const before = this.records.length;
+    if (this.totalBytes === 0 && this.records.length > 0) {
+      this.totalBytes = this.records.reduce(
+        (total, record) => total + storedRecordBytes(record),
+        0,
+      );
+    }
+    while (
+      this.records.length > this.maxRecords ||
+      (this.totalBytes > this.maxBytes && this.records.length > 1)
+    ) {
+      const removed = this.records.pop();
+      this.totalBytes = Math.max(
+        0,
+        this.totalBytes - storedRecordBytes(removed),
+      );
+    }
     return this.records.length !== before;
   }
 
@@ -332,6 +401,21 @@ export function buildRequestLogRecord(value, options = {}) {
     responseDetail: sanitizeUpstreamResponseDetail(
       value?.responseDetail,
     ),
+    streamTrace: sanitizeUpstreamStreamTrace(
+      value?.streamTrace,
+    ),
+    outcome:
+      sanitizeDiagnosticText(value?.outcome, {
+        maxLength: 40,
+      }) || null,
+    plan:
+      sanitizeDiagnosticText(value?.plan, {
+        maxLength: 128,
+      }) || null,
+    source:
+      sanitizeDiagnosticText(value?.source, {
+        maxLength: 160,
+      }) || null,
     errorMessage:
       sanitizeDiagnosticText(value?.errorMessage, {
         maxLength: 600,
@@ -398,6 +482,21 @@ function sanitizeStoredRecord(value) {
     responseDetail: sanitizeUpstreamResponseDetail(
       value.responseDetail,
     ),
+    streamTrace: sanitizeUpstreamStreamTrace(
+      value.streamTrace,
+    ),
+    outcome:
+      sanitizeDiagnosticText(value.outcome, {
+        maxLength: 40,
+      }) || null,
+    plan:
+      sanitizeDiagnosticText(value.plan, {
+        maxLength: 128,
+      }) || null,
+    source:
+      sanitizeDiagnosticText(value.source, {
+        maxLength: 160,
+      }) || null,
     errorMessage:
       sanitizeDiagnosticText(value.errorMessage, {
         maxLength: 600,
@@ -410,6 +509,21 @@ function serializeStoredRecord(record) {
     v: REQUEST_LOG_SCHEMA_VERSION,
     record,
   });
+}
+
+function storedRecordBytes(record) {
+  return Buffer.byteLength(`${serializeStoredRecord(record)}\n`);
+}
+
+function summarizeRequestLogRecord(record) {
+  const summary = structuredClone(record);
+  if (summary.streamTrace) {
+    summary.streamTrace = {
+      ...summary.streamTrace,
+      records: [],
+    };
+  }
+  return summary;
 }
 
 function calculateRequestStats(records) {
@@ -601,6 +715,146 @@ export function sanitizeUpstreamResponseDetail(value) {
     body: body.text || null,
     bodyTruncated: Boolean(value.bodyTruncated || body.truncated),
   };
+}
+
+export function sanitizeUpstreamStreamTrace(value, options = {}) {
+  if (!value || typeof value !== "object") return null;
+  const includeRecords = options.includeRecords !== false;
+  const sourceRecords =
+    includeRecords && Array.isArray(value.records)
+      ? value.records
+      : [];
+  const sourceRecordCount = clampInteger(
+    value.recordCount,
+    0,
+    MAX_STREAM_TRACE_RECORDS,
+    Array.isArray(value.records)
+      ? Math.min(value.records.length, MAX_STREAM_TRACE_RECORDS)
+      : 0,
+  );
+  const records = [];
+  let storedBytes = 0;
+  let truncated =
+    value.truncated === true ||
+    (includeRecords &&
+      Array.isArray(value.records) &&
+      value.records.length > MAX_STREAM_TRACE_RECORDS);
+
+  for (const source of sourceRecords.slice(
+    0,
+    MAX_STREAM_TRACE_RECORDS,
+  )) {
+    const record = {
+      index: clampInteger(
+        source?.index,
+        1,
+        MAX_STREAM_TRACE_RECORDS,
+        records.length + 1,
+      ),
+      event:
+        sanitizeDiagnosticText(source?.event, {
+          maxLength: 128,
+        }) || "message",
+      type:
+        sanitizeDiagnosticText(source?.type, {
+          maxLength: 128,
+        }) || "message",
+      data: sanitizeStructuredLogValue(source?.data),
+    };
+    const recordBytes = Buffer.byteLength(JSON.stringify(record));
+    if (
+      storedBytes + recordBytes > MAX_STREAM_TRACE_BYTES &&
+      records.length > 0
+    ) {
+      truncated = true;
+      break;
+    }
+    records.push(record);
+    storedBytes += recordBytes;
+  }
+
+  return {
+    attempt: clampInteger(value.attempt, 1, 10, null),
+    occurredAt: safeIsoDate(value.occurredAt, NaN),
+    latencyMs: clampInteger(
+      value.latencyMs,
+      0,
+      7 * 24 * 60 * 60 * 1_000,
+      null,
+    ),
+    status: clampInteger(value.status, 100, 599, null),
+    statusText:
+      sanitizeDiagnosticText(value.statusText, {
+        maxLength: 120,
+      }) || null,
+    contentType:
+      sanitizeDiagnosticText(value.contentType, {
+        maxLength: 160,
+      }) || null,
+    requestId:
+      sanitizeDiagnosticText(value.requestId, {
+        maxLength: 512,
+      }) || null,
+    transport:
+      sanitizeDiagnosticText(value.transport, {
+        maxLength: 40,
+      }) || null,
+    terminalEvent:
+      sanitizeDiagnosticText(value.terminalEvent, {
+        maxLength: 128,
+      }) || null,
+    eventCount: clampInteger(
+      value.eventCount,
+      0,
+      MAX_STREAM_TRACE_RECORDS,
+      records.filter((record) => record.type !== "done").length,
+    ),
+    recordCount: sourceRecordCount,
+    bodyBytes: clampInteger(
+      value.bodyBytes,
+      0,
+      16 * 1_024 * 1_024,
+      null,
+    ),
+    doneMarker: value.doneMarker === true,
+    records,
+    truncated,
+  };
+}
+
+function sanitizeStructuredLogValue(value, depth = 0) {
+  if (depth > 40) return "[MAX_DEPTH]";
+  if (typeof value === "string") {
+    return redactSensitiveText(value)
+      .replace(/\r\n?/g, "\n")
+      .replace(
+        /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,
+        " ",
+      );
+  }
+  if (
+    value === null ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) =>
+      sanitizeStructuredLogValue(entry, depth + 1),
+    );
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => !SENSITIVE_STRUCTURED_FIELD.test(key))
+        .map(([key, entry]) => [
+          redactSensitiveText(cleanText(key, 200)),
+          sanitizeStructuredLogValue(entry, depth + 1),
+        ]),
+    );
+  }
+  return String(value ?? "");
 }
 
 function safeEndpoint(value) {

@@ -795,6 +795,10 @@
   margin-top: 15px;
 }
 
+.admin-diagnostic-section[hidden] {
+  display: none;
+}
+
 .admin-diagnostic-section > div {
   display: flex;
   align-items: center;
@@ -839,6 +843,15 @@
 
 #request-log-request-body {
   max-height: 160px;
+}
+
+.admin-stream-section pre {
+  max-height: 520px;
+}
+
+.admin-log-detail-button:disabled {
+  cursor: wait;
+  opacity: 0.58;
 }
 
 @keyframes admin-spin {

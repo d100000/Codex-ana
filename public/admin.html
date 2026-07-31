@@ -43,7 +43,7 @@
           <h1>运行记录</h1>
           <p>
             查看分析任务汇总与最近 24 小时的请求审计日志。
-            分析历史只保留汇总；失败请求会额外保留脱敏后的诊断明细。
+            分析历史只保留汇总；每次上游请求会保留脱敏后的完整流式事件。
           </p>
         </div>
         <span class="privacy-badge">
@@ -290,7 +290,7 @@
                   <th scope="col">耗时</th>
                   <th scope="col">来源 / 域名</th>
                   <th scope="col">设备 / 样本</th>
-                  <th scope="col">错误码 / 请求 ID</th>
+                  <th scope="col">结果 / 请求 ID</th>
                 </tr>
               </thead>
               <tbody id="request-log-body">
@@ -311,7 +311,8 @@
           </div>
           <p class="admin-retention-note">
             普通站内请求仅记录方法、路由、状态码、耗时及不可逆摘要。
-            上游失败会额外保存固定探针的安全请求字段和最多 4 KB 的脱敏返回正文；
+            每次上游 Responses 请求会保存固定探针的安全请求字段和完整的脱敏 SSE 事件序列；
+            失败响应正文最多保留 4 KB；
             Authorization、Cookie、API Key 和查询参数不会进入日志。
             所有请求日志超过 24 小时后由服务端自动删除。
           </p>
@@ -366,8 +367,8 @@
         </button>
       </form>
       <div class="history-dialog-heading">
-        <p class="eyebrow">UPSTREAM FAILURE / 06</p>
-        <h2 id="request-log-dialog-title">失败请求明细</h2>
+        <p class="eyebrow">UPSTREAM RESPONSE / 06</p>
+        <h2 id="request-log-dialog-title">请求与流式响应明细</h2>
         <p id="request-log-dialog-subtitle"></p>
       </div>
       <dl
@@ -380,14 +381,27 @@
       </section>
       <section class="admin-diagnostic-section">
         <div>
-          <h3>上游返回报错</h3>
+          <h3 id="request-log-response-title">上游响应摘要</h3>
           <span id="request-log-truncated" hidden>已截断至 4 KB</span>
         </div>
         <pre id="request-log-response-body">—</pre>
       </section>
+      <section
+        class="admin-diagnostic-section admin-stream-section"
+        id="request-log-stream-section"
+        hidden
+      >
+        <div>
+          <h3>完整流式响应</h3>
+          <span id="request-log-stream-truncated" hidden>
+            已达到安全存储上限
+          </span>
+        </div>
+        <pre id="request-log-stream-body">—</pre>
+      </section>
       <p class="history-dialog-note">
         此明细只保留 24 小时，并经过服务端字段白名单与敏感值脱敏。
-        不包含 API Key、Authorization 或 Cookie。
+        SSE 记录按接收顺序展示；不包含 API Key、Authorization 或 Cookie。
       </p>
     </dialog>
   </body>

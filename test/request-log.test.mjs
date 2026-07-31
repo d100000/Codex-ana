@@ -33,7 +33,7 @@ test("request log records exclude query strings and unlisted input", () => {
   assert.doesNotMatch(serialized, /authorization|apiKey|headers|body/);
 });
 
-test("upstream failure logs keep diagnostics but redact credentials", () => {
+test("upstream logs keep every stream event but redact credentials", () => {
   const secret = "sk-upstream-log-secret-value";
   const record = buildRequestLogRecord({
     scope: "upstream",
@@ -88,6 +88,45 @@ test("upstream failure logs keep diagnostics but redact credentials", () => {
         },
       }),
     },
+    streamTrace: {
+      attempt: 1,
+      occurredAt: "2026-07-31T03:00:00.000Z",
+      latencyMs: 132,
+      status: 401,
+      contentType: "text/event-stream",
+      requestId: "upstream_req_001",
+      transport: "sse",
+      terminalEvent: "response.failed",
+      eventCount: 2,
+      recordCount: 2,
+      bodyBytes: 488,
+      records: [
+        {
+          index: 1,
+          event: "response.created",
+          type: "response.created",
+          data: {
+            type: "response.created",
+            response: { status: "in_progress" },
+          },
+        },
+        {
+          index: 2,
+          event: "response.failed",
+          type: "response.failed",
+          data: {
+            type: "response.failed",
+            message: `Bearer ${secret}`,
+            api_key: secret,
+            metadata: {
+              access_token: "opaque-credential-value",
+              safe: "retained",
+              [secret]: "dynamic secret field name",
+            },
+          },
+        },
+      ],
+    },
   });
   const serialized = JSON.stringify(record);
 
@@ -101,9 +140,92 @@ test("upstream failure logs keep diagnostics but redact credentials", () => {
     JSON.parse(record.responseDetail.body).error.access_token,
     "[REDACTED]",
   );
+  assert.equal(record.streamTrace.records.length, 2);
+  assert.equal(
+    record.streamTrace.records[1].data.metadata.safe,
+    "retained",
+  );
+  assert.equal(
+    record.streamTrace.records[1].data.message,
+    "Bearer [REDACTED]",
+  );
   assert.doesNotMatch(serialized, new RegExp(secret));
   assert.doesNotMatch(serialized, /Bearer sk-/);
-  assert.doesNotMatch(serialized, /"authorization"/i);
+  assert.doesNotMatch(
+    serialized,
+    /"authorization"|"api_key"|"access_token"/i,
+  );
+});
+
+test("request log lists omit event payloads and detail reads keep them", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "planscope-request-log-detail-"),
+  );
+  const filePath = join(directory, "request-log.ndjson");
+
+  try {
+    const store = await new RequestLogStore({
+      filePath,
+      maxRecords: 100,
+    }).init();
+    await store.record({
+      scope: "upstream",
+      requestId: "request-id-stream-0001",
+      occurredAt: new Date().toISOString(),
+      method: "POST",
+      path: "/v1/responses",
+      statusCode: 200,
+      upstreamStatus: 200,
+      durationMs: 42,
+      domain: "gateway.example",
+      model: "gpt-5.5",
+      sampleIndex: 1,
+      attempt: 1,
+      outcome: "classified",
+      plan: "Pro",
+      streamTrace: {
+        attempt: 1,
+        occurredAt: new Date().toISOString(),
+        latencyMs: 42,
+        status: 200,
+        transport: "sse",
+        terminalEvent: "response.completed",
+        eventCount: 2,
+        recordCount: 2,
+        bodyBytes: 256,
+        records: [
+          {
+            index: 1,
+            event: "response.created",
+            type: "response.created",
+            data: { type: "response.created" },
+          },
+          {
+            index: 2,
+            event: "response.completed",
+            type: "response.completed",
+            data: {
+              type: "response.completed",
+              response: { status: "completed" },
+            },
+          },
+        ],
+      },
+    });
+
+    const summary = store.list().records[0];
+    assert.equal(summary.streamTrace.recordCount, 2);
+    assert.deepEqual(summary.streamTrace.records, []);
+
+    const detail = store.get("request-id-stream-0001");
+    assert.equal(detail.streamTrace.records.length, 2);
+    assert.equal(
+      detail.streamTrace.records[1].type,
+      "response.completed",
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("request logs expire after 24 hours and persist with restricted permissions", async () => {
@@ -194,6 +316,69 @@ test("request logs expire after 24 hours and persist with restricted permissions
       now: () => now,
     }).init();
     assert.equal(reloaded.list().total, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("request log byte capacity compacts the on-disk file immediately", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "planscope-request-log-capacity-"),
+  );
+  const filePath = join(directory, "request-log.ndjson");
+  const largeData = "x".repeat(420_000);
+
+  try {
+    const store = await new RequestLogStore({
+      filePath,
+      maxRecords: 100,
+      maxBytes: 1 * 1_024 * 1_024,
+    }).init();
+    for (let index = 1; index <= 3; index += 1) {
+      await store.record({
+        scope: "upstream",
+        requestId: `capacity-request-000${index}`,
+        occurredAt: new Date(Date.now() + index).toISOString(),
+        method: "POST",
+        path: "/v1/responses",
+        statusCode: 200,
+        durationMs: 10,
+        domain: "gateway.example",
+        model: "gpt-5.5",
+        sampleIndex: index,
+        attempt: 1,
+        streamTrace: {
+          eventCount: 1,
+          recordCount: 1,
+          records: [
+            {
+              index: 1,
+              event: "response.completed",
+              type: "response.completed",
+              data: {
+                type: "response.completed",
+                payload: largeData,
+              },
+            },
+          ],
+        },
+      });
+    }
+
+    const inMemory = store.list({ limit: 100 });
+    assert.equal(inMemory.totalStored, 2);
+    assert.equal(
+      inMemory.records.some(
+        (record) => record.requestId === "capacity-request-0001",
+      ),
+      false,
+    );
+
+    const stored = await readFile(filePath, "utf8");
+    assert.doesNotMatch(stored, /capacity-request-0001/);
+    assert.match(stored, /capacity-request-0002/);
+    assert.match(stored, /capacity-request-0003/);
+    assert.ok(Buffer.byteLength(stored) <= 1 * 1_024 * 1_024);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

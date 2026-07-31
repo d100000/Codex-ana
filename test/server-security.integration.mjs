@@ -358,6 +358,33 @@ async function verifyJobOwnership() {
       ownerRead.json.samples[0].failureDetails[0].response.status,
       503,
     );
+    assert.equal(
+      ownerRead.json.samples[0].responseTrace.recordCount,
+      4,
+    );
+    assert.deepEqual(
+      ownerRead.json.samples[0].responseTrace.records,
+      [],
+    );
+
+    const ownerSampleDetail = await send({
+      port: appPort,
+      path: `${analysis.json.location}/samples/1`,
+      headers: { Cookie: ownerCookie },
+    });
+    assert.equal(ownerSampleDetail.status, 200);
+    assert.deepEqual(
+      ownerSampleDetail.json.sample.responseTrace.records.map(
+        (record) => record.type,
+      ),
+      [
+        "response.created",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.completed",
+      ],
+    );
+    assert.doesNotMatch(ownerSampleDetail.text, /sk-test-local/);
     assert.match(
       ownerRead.json.samples[0].failureDetails[0].response.body,
       /\[REDACTED\]/,
@@ -370,6 +397,12 @@ async function verifyJobOwnership() {
     });
     assert.equal(foreignRead.status, 404);
     assert.equal(foreignRead.json.error.code, "job_not_found");
+
+    const foreignSampleDetail = await send({
+      port: appPort,
+      path: `${analysis.json.location}/samples/1`,
+    });
+    assert.equal(foreignSampleDetail.status, 404);
 
     const foreignCancel = await send({
       port: appPort,
@@ -429,15 +462,16 @@ async function verifyJobOwnership() {
 
     const upstreamLogs = await send({
       port: appPort,
-      path: "/api/admin/request-logs?q=%2Fv1%2Fresponses",
+      path: "/api/admin/request-logs?q=%2Fv1%2Fresponses&limit=100",
       headers: { Cookie: `${ownerCookie}; ${adminCookie}` },
     });
     assert.equal(upstreamLogs.status, 200);
-    assert.ok(upstreamLogs.json.records.length >= 1);
+    assert.ok(upstreamLogs.json.records.length >= 2);
     const upstreamFailure = upstreamLogs.json.records.find(
       (record) =>
         record.scope === "upstream" &&
-        record.sampleIndex === 1,
+        record.sampleIndex === 1 &&
+        record.errorCode === "http_503",
     );
     assert.ok(upstreamFailure);
     assert.equal(upstreamFailure.domain, `localhost:${mockPort}`);
@@ -448,22 +482,75 @@ async function verifyJobOwnership() {
       upstreamFailure.responseDetail.body,
       /\[REDACTED\]/,
     );
+    const upstreamSuccess = upstreamLogs.json.records.find(
+      (record) =>
+        record.scope === "upstream" &&
+        record.sampleIndex === 1 &&
+        record.outcome === "classified",
+    );
+    assert.ok(upstreamSuccess);
+    assert.equal(upstreamSuccess.attempt, 2);
+    assert.equal(upstreamSuccess.plan, "Pro");
+    assert.equal(upstreamSuccess.streamTrace.recordCount, 4);
+    assert.deepEqual(upstreamSuccess.streamTrace.records, []);
+    assert.ok(
+      upstreamLogs.json.records.some(
+        (record) =>
+          record.scope === "upstream" &&
+          record.outcome === "cancelled" &&
+          record.statusCode === 499,
+      ),
+    );
+
+    const unauthenticatedDetail = await send({
+      port: appPort,
+      path: `/api/admin/request-logs/${upstreamSuccess.requestId}`,
+      headers: { Cookie: ownerCookie },
+    });
+    assert.equal(unauthenticatedDetail.status, 401);
+
+    const upstreamDetail = await send({
+      port: appPort,
+      path: `/api/admin/request-logs/${upstreamSuccess.requestId}`,
+      headers: { Cookie: `${ownerCookie}; ${adminCookie}` },
+    });
+    assert.equal(upstreamDetail.status, 200);
+    assert.equal(upstreamDetail.json.record.streamTrace.records.length, 4);
+    assert.deepEqual(
+      upstreamDetail.json.record.streamTrace.records.map(
+        (record) => record.type,
+      ),
+      [
+        "response.created",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.completed",
+      ],
+    );
+    assert.equal(
+      upstreamDetail.json.record.streamTrace.records[1].data.delta,
+      "OK",
+    );
     assert.doesNotMatch(upstreamLogs.text, /sk-test-local/);
+    assert.doesNotMatch(upstreamDetail.text, /sk-test-local/);
     assert.doesNotMatch(
-      upstreamLogs.text,
+      `${upstreamLogs.text}${upstreamDetail.text}`,
       /authorization|cookie|apiKey/i,
     );
 
     console.log(
       JSON.stringify({
         ownerRead: ownerRead.status,
+        ownerSampleDetail: ownerSampleDetail.status,
         foreignRead: foreignRead.status,
+        foreignSampleDetail: foreignSampleDetail.status,
         foreignCancel: foreignCancel.status,
         ownerCancel: ownerCancel.status,
         terminalStreamClosed: terminalEvents.status,
         historyRecord: history.status,
         historyDomain: history.json.records[0].domain,
         upstreamFailureLog: upstreamLogs.status,
+        upstreamStreamDetail: upstreamDetail.status,
       }),
     );
   } finally {

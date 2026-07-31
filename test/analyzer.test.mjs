@@ -114,6 +114,23 @@ test("Responses SSE is parsed across chunks until response.completed", async () 
   assert.equal(result.terminalEvent, "response.completed");
   assert.equal(result.eventCount, 3);
   assert.equal(result.payload.rate_limits.plan_type, "education_k12");
+  assert.equal(result.streamTrace.recordCount, 3);
+  assert.deepEqual(
+    result.streamTrace.records.map((record) => record.type),
+    [
+      "response.created",
+      "response.output_text.delta",
+      "response.completed",
+    ],
+  );
+  assert.equal(
+    result.streamTrace.records[1].data.delta,
+    "OK",
+  );
+  assert.equal(
+    result.streamTrace.records[2].data.response.rate_limits.plan_type,
+    "education_k12",
+  );
 
   const plan = extractPlanFromResponse(response.headers, result.payload);
   assert.equal(plan.normalized.key, "education_k12");
@@ -127,16 +144,33 @@ test("Responses SSE error events are redacted and retryable", async () => {
       type: "error",
       code: "server_error",
       message: `temporary failure for ${secret}`,
+      api_key: secret,
+      metadata: {
+        authorization: `Bearer ${secret}`,
+        safe: "retained",
+        [secret]: "dynamic secret field name",
+      },
     })}\n\n`,
   ]);
 
   await assert.rejects(
     readResponsesPayload(response, { secrets: [secret] }),
-    (error) =>
-      error?.code === "responses_stream_error" &&
-      error.retryable === true &&
-      error.message.includes("[REDACTED]") &&
-      !error.message.includes(secret),
+    (error) => {
+      assert.equal(error?.code, "responses_stream_error");
+      assert.equal(error.retryable, true);
+      assert.match(error.message, /\[REDACTED\]/);
+      assert.doesNotMatch(error.message, new RegExp(secret));
+      assert.equal(error.streamTrace.recordCount, 1);
+      assert.equal(error.streamTrace.records[0].type, "error");
+      assert.equal(
+        error.streamTrace.records[0].data.metadata.safe,
+        "retained",
+      );
+      const serialized = JSON.stringify(error.streamTrace);
+      assert.doesNotMatch(serialized, new RegExp(secret));
+      assert.doesNotMatch(serialized, /api_key|authorization/i);
+      return true;
+    },
   );
 });
 
@@ -148,9 +182,16 @@ test("truncated Responses SSE is rejected instead of counted as unknown", async 
 
   await assert.rejects(
     readResponsesPayload(response),
-    (error) =>
-      error?.code === "incomplete_responses_stream" &&
-      error.retryable === true,
+    (error) => {
+      assert.equal(error?.code, "incomplete_responses_stream");
+      assert.equal(error.retryable, true);
+      assert.equal(error.streamTrace.recordCount, 1);
+      assert.equal(
+        error.streamTrace.records[0].type,
+        "response.created",
+      );
+      return true;
+    },
   );
 });
 

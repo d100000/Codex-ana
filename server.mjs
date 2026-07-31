@@ -43,6 +43,7 @@ import {
   REQUEST_LOG_RETENTION_MS,
   sanitizeUpstreamRequestSummary,
   sanitizeUpstreamResponseDetail,
+  sanitizeUpstreamStreamTrace,
 } from "./src/request-log.mjs";
 import { sanitizeDiagnosticText } from "./src/redaction.mjs";
 
@@ -101,6 +102,12 @@ const MAX_REQUEST_LOG_RECORDS = readIntegerEnv(
   100,
   100_000,
 );
+const MAX_REQUEST_LOG_BYTES = readIntegerEnv(
+  "MAX_REQUEST_LOG_BYTES",
+  256 * 1_024 * 1_024,
+  1 * 1_024 * 1_024,
+  1 * 1_024 * 1_024 * 1_024,
+);
 const DATA_DIR = resolve(
   ROOT_DIR,
   process.env.PLANSCOPE_DATA_DIR || ".data",
@@ -118,6 +125,7 @@ const adminHistory = await new AdminHistoryStore({
 const requestLog = await new RequestLogStore({
   filePath: join(DATA_DIR, "request-log.ndjson"),
   maxRecords: MAX_REQUEST_LOG_RECORDS,
+  maxBytes: MAX_REQUEST_LOG_BYTES,
   retentionMs: REQUEST_LOG_RETENTION_MS,
 }).init();
 const requestLogCleanupTimer = setInterval(() => {
@@ -232,6 +240,7 @@ const server = createServer(async (request, response) => {
             cleanupIntervalSeconds:
               REQUEST_LOG_CLEANUP_INTERVAL_MS / 1_000,
             maxRecords: MAX_REQUEST_LOG_RECORDS,
+            maxBytes: MAX_REQUEST_LOG_BYTES,
           },
         },
       });
@@ -326,6 +335,22 @@ const server = createServer(async (request, response) => {
         method: url.searchParams.get("method"),
       });
       sendJson(response, 200, result);
+      return;
+    }
+
+    const requestLogDetailMatch = pathname.match(
+      /^\/api\/admin\/request-logs\/([A-Za-z0-9_-]{8,64})$/,
+    );
+    if (request.method === "GET" && requestLogDetailMatch) {
+      requireAdminSession(request, response);
+      const record = requestLog.get(requestLogDetailMatch[1]);
+      if (!record) {
+        throw new ServiceError("请求日志不存在或已超过 24 小时。", {
+          code: "request_log_not_found",
+          httpStatus: 404,
+        });
+      }
+      sendJson(response, 200, { record });
       return;
     }
 
@@ -480,6 +505,32 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    const sampleDetailMatch = pathname.match(
+      /^\/api\/jobs\/([a-f0-9-]+)\/samples\/(\d{1,3})$/i,
+    );
+    if (request.method === "GET" && sampleDetailMatch) {
+      const identity = identifyClient(request, response);
+      const job = getOwnedJob(sampleDetailMatch[1], identity);
+      const sampleNumber = Number(sampleDetailMatch[2]);
+      const sample = job.state?.samples?.[sampleNumber - 1];
+      if (
+        !Number.isInteger(sampleNumber) ||
+        sampleNumber < 1 ||
+        !sample
+      ) {
+        throw new ServiceError("样本不存在或已过期。", {
+          code: "sample_not_found",
+          httpStatus: 404,
+        });
+      }
+      sendJson(response, 200, {
+        sample: sanitizeSample(sample, {
+          includeStreamRecords: true,
+        }),
+      });
+      return;
+    }
+
     const jobMatch = pathname.match(/^\/api\/jobs\/([a-f0-9-]+)$/i);
     if (request.method === "GET" && jobMatch) {
       const identity = identifyClient(request, response);
@@ -598,9 +649,9 @@ async function runJob(job, credentials) {
     // Ensure credentials cannot remain reachable after the task finishes.
     credentials.apiKey = "";
     try {
-      await recordUpstreamFailureLogs(job);
+      await recordUpstreamRequestLogs(job);
     } catch (error) {
-      console.error("Upstream failure log write failed:", {
+      console.error("Upstream request log write failed:", {
         name: error?.name,
         code: error?.code,
       });
@@ -648,7 +699,9 @@ function snapshotJob(job) {
   };
 }
 
-function sanitizeSample(sample) {
+function sanitizeSample(sample, options = {}) {
+  const includeStreamRecords =
+    options.includeStreamRecords === true;
   return {
     index: sample.index,
     status: sample.status,
@@ -660,6 +713,10 @@ function sanitizeSample(sample) {
     httpStatus: sample.httpStatus ?? null,
     latencyMs: sample.latencyMs ?? null,
     evidence: sample.evidence ?? null,
+    responseTrace: sanitizeUpstreamStreamTrace(
+      sample.responseTrace,
+      { includeRecords: includeStreamRecords },
+    ),
     error: sample.error ?? null,
     requestSummary: sanitizeUpstreamRequestSummary(
       sample.requestSummary,
@@ -669,13 +726,17 @@ function sanitizeSample(sample) {
       : []
     )
       .slice(-10)
-      .map(sanitizeFailureDetail),
+      .map((detail) =>
+        sanitizeFailureDetail(detail, {
+          includeStreamRecords,
+        }),
+      ),
     startedAt: sample.startedAt ?? null,
     completedAt: sample.completedAt ?? null,
   };
 }
 
-function sanitizeFailureDetail(detail) {
+function sanitizeFailureDetail(detail, options = {}) {
   const status = Number(detail?.error?.status);
   return {
     attempt: safeInteger(detail?.attempt, 1, 10, 1),
@@ -699,14 +760,28 @@ function sanitizeFailureDetail(detail) {
       retryable: detail?.error?.retryable === true,
     },
     response: sanitizeUpstreamResponseDetail(detail?.response),
+    responseTrace: sanitizeUpstreamStreamTrace(
+      detail?.responseTrace,
+      {
+        includeRecords:
+          options.includeStreamRecords === true,
+      },
+    ),
   };
 }
 
-async function recordUpstreamFailureLogs(job) {
+async function recordUpstreamRequestLogs(job) {
   const target = safeUpstreamTarget(job.safeTarget);
   for (const sample of job.state?.samples ?? []) {
-    const publicSample = sanitizeSample(sample);
+    const publicSample = sanitizeSample(sample, {
+      includeStreamRecords: true,
+    });
     for (const failure of publicSample.failureDetails) {
+      const cancelled =
+        job.status === "cancelled" &&
+        ["cancelled", "request_aborted"].includes(
+          failure.error.code,
+        );
       const upstreamStatus =
         failure.response?.status ?? failure.error.status ?? null;
       await requestLog.record({
@@ -716,7 +791,7 @@ async function recordUpstreamFailureLogs(job) {
         occurredAt: failure.occurredAt,
         method: "POST",
         path: target.path,
-        statusCode: upstreamStatus ?? 502,
+        statusCode: upstreamStatus ?? (cancelled ? 499 : 502),
         upstreamStatus,
         durationMs: failure.latencyMs,
         errorCode: failure.error.code,
@@ -727,8 +802,46 @@ async function recordUpstreamFailureLogs(job) {
         attempt: failure.attempt,
         requestSummary: publicSample.requestSummary,
         responseDetail: failure.response,
+        streamTrace: failure.responseTrace,
+        outcome: cancelled ? "cancelled" : "failed",
       });
     }
+    if (!publicSample.responseTrace) continue;
+    const trace = publicSample.responseTrace;
+    const upstreamStatus =
+      trace.status ?? publicSample.httpStatus ?? 200;
+    await requestLog.record({
+      scope: "upstream",
+      requestId: randomUUID(),
+      jobId: job.id,
+      occurredAt:
+        trace.occurredAt ??
+        publicSample.completedAt ??
+        job.updatedAt,
+      method: "POST",
+      path: target.path,
+      statusCode: upstreamStatus,
+      upstreamStatus,
+      durationMs:
+        trace.latencyMs ?? publicSample.latencyMs ?? 0,
+      errorCode: null,
+      errorMessage: null,
+      domain: target.domain,
+      model: job.state?.selectedModel,
+      sampleIndex: Number(sample.index) + 1,
+      attempt: trace.attempt ?? publicSample.attempts,
+      requestSummary: publicSample.requestSummary,
+      responseDetail: {
+        status: trace.status,
+        statusText: trace.statusText,
+        contentType: trace.contentType,
+        requestId: trace.requestId,
+      },
+      streamTrace: trace,
+      outcome: publicSample.status,
+      plan: publicSample.plan?.label ?? null,
+      source: publicSample.source,
+    });
   }
 }
 
@@ -1069,11 +1182,25 @@ function requestLogRoute(value) {
     return pathname;
   }
 
+  if (
+    /^\/api\/jobs\/[a-f0-9-]+\/samples\/\d{1,3}$/i.test(
+      pathname,
+    )
+  ) {
+    return "/api/jobs/:jobId/samples/:sampleNumber";
+  }
   const jobRoute = pathname.match(
     /^\/api\/jobs\/[a-f0-9-]+(\/events|\/cancel)?$/i,
   );
   if (jobRoute) {
     return `/api/jobs/:jobId${jobRoute[1] ?? ""}`;
+  }
+  if (
+    /^\/api\/admin\/request-logs\/[A-Za-z0-9_-]{8,64}$/.test(
+      pathname,
+    )
+  ) {
+    return "/api/admin/request-logs/:requestId";
   }
   return "/[unmatched]";
 }
@@ -1337,7 +1464,7 @@ server.listen(PORT, HOST, () => {
     `网络保护：SSRF 防护已启用 / ${upstreamFetch.policy.allowHttp ? "允许显式 HTTP" : "仅 HTTPS"} / 最大并行任务 ${MAX_ACTIVE_JOBS}`,
   );
   console.log(
-    `请求日志：仅保留 24 小时 / 最多 ${MAX_REQUEST_LOG_RECORDS} 条 / 上游失败仅保存脱敏诊断`,
+    `请求日志：仅保留 24 小时 / 最多 ${MAX_REQUEST_LOG_RECORDS} 条 / 最大 ${Math.round(MAX_REQUEST_LOG_BYTES / 1_024 / 1_024)} MiB / 上游 SSE 事件完整脱敏留存`,
   );
   if (adminPasswordConfig.generated) {
     console.log(
