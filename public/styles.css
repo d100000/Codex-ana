@@ -1001,6 +1001,52 @@ body.is-verifying {
   font-size: 20px;
 }
 
+.result-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-top: 15px;
+  padding: 14px 15px;
+  color: #73500b;
+  border: 1px solid rgba(217, 145, 23, 0.34);
+  border-radius: 9px;
+  background: #fff8e9;
+}
+
+.result-notice[hidden] {
+  display: none;
+}
+
+.result-notice-mark {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  border-radius: 50%;
+  background: var(--amber);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.result-notice strong {
+  font-size: 12px;
+}
+
+.result-notice p {
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.result-notice code {
+  color: #5f430b;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));

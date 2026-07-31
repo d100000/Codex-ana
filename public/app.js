@@ -71,6 +71,7 @@ const elements = {
   errorTitle: document.querySelector("#error-title"),
   errorMessage: document.querySelector("#error-message"),
   dismissError: document.querySelector("#dismiss-error"),
+  resultNotice: document.querySelector("#result-notice"),
   completedMetric: document.querySelector("#completed-metric"),
   successMetric: document.querySelector("#success-metric"),
   tierCountMetric: document.querySelector("#tier-count-metric"),
@@ -963,6 +964,7 @@ function render(snapshot) {
   }
   registerPlanColors(snapshot.breakdown?.plans || []);
   renderStatus(snapshot);
+  renderResultNotice(snapshot);
   renderMetrics(snapshot.breakdown);
   renderMatrix(snapshot.samples);
   renderMatrixLegend(snapshot.breakdown);
@@ -1007,6 +1009,9 @@ function statusDescription(snapshot) {
     return "运行后，这里会实时显示模型验证、并发采样、随机重试与完成状态。";
   }
   if (snapshot.status === "completed") {
+    if (needsPassThroughNotice(snapshot)) {
+      return "分析已完成，但所有成功响应均未透传可识别的 Codex 订阅字段。";
+    }
     return `本次采样已结束，共识别 ${snapshot.breakdown?.classified || 0} 个有效订阅等级。`;
   }
   if (snapshot.status === "failed") {
@@ -1021,9 +1026,28 @@ function statusDescription(snapshot) {
   return "正在并发采集独立样本；可点击已完成的格子查看订阅证据。";
 }
 
+function renderResultNotice(snapshot) {
+  elements.resultNotice.hidden = !needsPassThroughNotice(snapshot);
+}
+
+function needsPassThroughNotice(snapshot) {
+  const breakdown = snapshot?.breakdown;
+  return (
+    snapshot?.status === "completed" &&
+    Number(breakdown?.classified || 0) === 0 &&
+    Number(breakdown?.unknown || 0) > 0 &&
+    (!Array.isArray(breakdown?.plans) ||
+      breakdown.plans.length === 0)
+  );
+}
+
 function renderMetrics(breakdown = {}) {
   const total = breakdown.total || FIXED_TOTAL;
   const tierCount = breakdown.plans?.length || 0;
+  const missingPassThrough =
+    tierCount === 0 &&
+    Number(breakdown.classified || 0) === 0 &&
+    Number(breakdown.unknown || 0) > 0;
 
   setMetric(elements.completedMetric, breakdown.completed || 0, `/${total}`);
   elements.successMetric.textContent =
@@ -1032,7 +1056,11 @@ function renderMetrics(breakdown = {}) {
       : "等待开始采样";
   setMetric(elements.tierCountMetric, tierCount, "种");
   elements.tierCountCopy.textContent =
-    tierCount > 0 ? "完全按接口返回值统计" : "按返回的 tier 自动去重";
+    tierCount > 0
+      ? "完全按接口返回值统计"
+      : missingPassThrough
+        ? "请上游开放订阅字段透传"
+        : "按返回的 tier 自动去重";
   setMetric(
     elements.classifiedMetric,
     formatPercent(toPercent(breakdown.classified || 0, total)),

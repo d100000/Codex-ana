@@ -229,6 +229,24 @@
           <button id="dismiss-error" type="button" aria-label="关闭错误提示">×</button>
         </section>
 
+        <section
+          class="result-notice"
+          id="result-notice"
+          role="status"
+          aria-live="polite"
+          hidden
+        >
+          <span class="result-notice-mark" aria-hidden="true">i</span>
+          <div>
+            <strong>未识别到订阅类型</strong>
+            <p>
+              本次所有成功响应均未返回 Codex 订阅字段。请上游开放
+              <code>x-codex-plan-type</code> 或 <code>plan_type</code>
+              字段透传，用于识别订阅类型。
+            </p>
+          </div>
+        </section>
+
         <section class="metric-grid" aria-label="核心指标">
           <article class="metric-card metric-card--primary">
             <span>已完成</span>
