@@ -983,7 +983,9 @@ function renderStatus(snapshot) {
   const completed = breakdown.completed || 0;
   const total = breakdown.total || FIXED_TOTAL;
   const progress = Math.min(100, Math.round((completed / total) * 100));
-  const label = JOB_LABELS[snapshot.status] || "等待输入";
+  const label = isSubscriptionDataUnavailable(snapshot)
+    ? "预检终止"
+    : JOB_LABELS[snapshot.status] || "等待输入";
 
   elements.statusBadge.className = `status-badge is-${snapshot.status || "idle"}`;
   elements.statusBadge.lastChild.textContent = ` ${label}`;
@@ -1015,6 +1017,9 @@ function statusDescription(snapshot) {
     return `本次采样已结束，共识别 ${snapshot.breakdown?.classified || 0} 个有效订阅等级。`;
   }
   if (snapshot.status === "failed") {
+    if (isSubscriptionDataUnavailable(snapshot)) {
+      return "首个样本未返回可识别的订阅字段，剩余 99 次请求未执行。";
+    }
     return "任务已自动停止并关闭实时连接；失败前完成的样本仍可检查。";
   }
   if (snapshot.status === "cancelled") {
@@ -1024,6 +1029,10 @@ function statusDescription(snapshot) {
     return "先验证地址、密钥和可用模型，避免直接触发大批量无效请求。";
   }
   return "正在并发采集独立样本；可点击已完成的格子查看订阅证据。";
+}
+
+function isSubscriptionDataUnavailable(snapshot) {
+  return snapshot?.error?.code === "subscription_data_unavailable";
 }
 
 function renderResultNotice(snapshot) {
@@ -1769,6 +1778,8 @@ function setBusy(busy) {
 function finishTerminalAnalysis(options = {}) {
   const status = currentSnapshot.status;
   const showFailure = options.showFailure !== false;
+  const subscriptionDataUnavailable =
+    isSubscriptionDataUnavailable(currentSnapshot);
   closeEventStream();
   stopElapsedTimer();
   currentJobId = null;
@@ -1779,7 +1790,9 @@ function finishTerminalAnalysis(options = {}) {
 
   if (status === "failed") {
     setModelStatus(
-      "分析已自动停止；请重新填写 API Key 并读取模型后重试。",
+      subscriptionDataUnavailable
+        ? "首个样本未返回订阅字段，剩余请求未执行。"
+        : "分析已自动停止；请重新填写 API Key 并读取模型后重试。",
       "is-error",
     );
   } else if (status === "cancelled") {
@@ -1797,7 +1810,9 @@ function finishTerminalAnalysis(options = {}) {
   setBusy(false);
   if (status === "failed" && showFailure) {
     showError(
-      "分析已自动停止",
+      subscriptionDataUnavailable
+        ? "无法获取订阅数据"
+        : "分析已自动停止",
       currentSnapshot.error?.message || "上游接口未能完成采样。",
     );
   }

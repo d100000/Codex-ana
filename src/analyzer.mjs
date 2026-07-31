@@ -537,6 +537,16 @@ export async function analyzeSubscriptionPool(options) {
       },
     );
   }
+  if (firstSample.status === "unknown") {
+    const skippedRequests = Math.max(0, config.totalRequests - 1);
+    throw new AnalysisError(
+      `无法获取订阅数据：首个样本请求成功，但响应未返回 x-codex-plan-type 或 plan_type。已停止后续 ${skippedRequests} 次请求，请上游开放订阅字段透传。`,
+      {
+        code: "subscription_data_unavailable",
+        status: firstSample.httpStatus,
+      },
+    );
+  }
 
   state.stage = `正在以 ${config.concurrency} 并发采集剩余样本`;
   notify();

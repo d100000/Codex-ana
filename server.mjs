@@ -636,7 +636,10 @@ async function runJob(job, credentials) {
     } else {
       job.status = "failed";
       job.state.status = "failed";
-      job.state.stage = "分析已停止";
+      job.state.stage =
+        error?.code === "subscription_data_unavailable"
+          ? "无法获取订阅数据"
+          : "分析已停止";
       job.state.error = {
         code: error?.code ?? "analysis_failed",
         message: error?.message ?? "分析失败",

@@ -412,42 +412,94 @@ test("failed samples retain bounded, redacted upstream diagnostics", async () =>
   assert.doesNotMatch(serialized, new RegExp(echoedToken));
 });
 
+test("analyzer stops after one successful sample without subscription data", async () => {
+  let responseRequests = 0;
+  let latestState;
+
+  await assert.rejects(
+    analyzeSubscriptionPool({
+      baseUrl: "https://gateway.example",
+      apiKey: "sk-test",
+      model: "gpt-5.5",
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/models")) {
+          return Response.json({ data: [{ id: "gpt-5.5" }] });
+        }
+        responseRequests += 1;
+        return Response.json({ output: [] });
+      },
+      onUpdate(state) {
+        latestState = structuredClone(state);
+      },
+      config: {
+        totalRequests: 100,
+        concurrency: 50,
+        maxAttempts: 5,
+        retryMinMs: 1,
+        retryMaxMs: 2,
+        requestTimeoutMs: 5_000,
+      },
+    }),
+    (error) =>
+      error?.code === "subscription_data_unavailable" &&
+      error.message.includes("无法获取订阅数据") &&
+      error.message.includes("停止后续 99 次请求"),
+  );
+
+  assert.equal(responseRequests, 1);
+  assert.equal(latestState.breakdown.completed, 1);
+  assert.equal(latestState.breakdown.unknown, 1);
+  assert.equal(latestState.breakdown.pending, 99);
+  assert.equal(latestState.breakdown.attempts, 1);
+  assert.equal(latestState.samples[0].status, "unknown");
+  assert.ok(
+    latestState.samples.slice(1).every((sample) => sample.status === "queued"),
+  );
+});
+
 test("successful upstream metadata cannot echo API keys into snapshots", async () => {
   const apiKey = "sk-sensitive-success-value";
-  const state = await analyzeSubscriptionPool({
-    baseUrl: "https://gateway.example",
-    apiKey,
-    model: "gpt-5.5",
-    fetchImpl: async (url) => {
-      if (String(url).endsWith("/models")) {
-        return Response.json({ data: [{ id: "gpt-5.5" }] });
-      }
-      return Response.json(
-        { output: [] },
-        {
-          headers: {
-            "x-codex-plan-type": apiKey,
-            "x-request-id": `request-${apiKey}`,
+  let latestState;
+  await assert.rejects(
+    analyzeSubscriptionPool({
+      baseUrl: "https://gateway.example",
+      apiKey,
+      model: "gpt-5.5",
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/models")) {
+          return Response.json({ data: [{ id: "gpt-5.5" }] });
+        }
+        return Response.json(
+          { output: [] },
+          {
+            headers: {
+              "x-codex-plan-type": apiKey,
+              "x-request-id": `request-${apiKey}`,
+            },
           },
-        },
-      );
-    },
-    config: {
-      totalRequests: 1,
-      concurrency: 1,
-      maxAttempts: 1,
-      retryMinMs: 1,
-      retryMaxMs: 1,
-      requestTimeoutMs: 5_000,
-    },
-  });
+        );
+      },
+      onUpdate(state) {
+        latestState = structuredClone(state);
+      },
+      config: {
+        totalRequests: 1,
+        concurrency: 1,
+        maxAttempts: 1,
+        retryMinMs: 1,
+        retryMaxMs: 1,
+        requestTimeoutMs: 5_000,
+      },
+    }),
+    (error) => error?.code === "subscription_data_unavailable",
+  );
 
-  assert.equal(state.samples[0].status, "unknown");
+  assert.equal(latestState.samples[0].status, "unknown");
   assert.equal(
-    state.samples[0].evidence.upstreamRequestId,
+    latestState.samples[0].evidence.upstreamRequestId,
     "request-[REDACTED]",
   );
-  assert.equal(JSON.stringify(state).includes(apiKey), false);
+  assert.equal(JSON.stringify(latestState).includes(apiKey), false);
 });
 
 test("reasoning effort uses the fastest compatible level", () => {
